@@ -1,0 +1,30 @@
+name: wolfCrypt test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  wolfcrypt-test:
+    name: wolfCrypt + NXP SDK integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build wolfcrypt-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: SE050Sim
+          file: SE050Sim/Dockerfile.wolfcrypt
+          tags: se050-wolfcrypt-test:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run wolfCrypt test suite
+        run: docker run --rm se050-wolfcrypt-test:ci

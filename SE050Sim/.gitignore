@@ -1,0 +1,17 @@
+# Build artifacts
+target/
+se050-sim/target/
+
+# Cloned driver (fetched at build time / in Docker)
+nxp-se050/
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

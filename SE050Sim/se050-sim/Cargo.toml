@@ -1,0 +1,31 @@
+[package]
+name = "se050-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Software simulator for the NXP SE050 secure element"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+embedded-hal = "0.2"
+crc16 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+p224 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p384 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+rsa = { version = "0.9", features = ["sha2", "hazmat"] }
+sha1 = "0.10"
+sha2 = "0.10"
+signature = "2.2"
+rand = "0.8"
+hex = "0.4"
+log = "0.4"
+
+[dev-dependencies]
+se050 = { path = "../nxp-se050/se050" }
+delog = "0.1"

@@ -1,0 +1,172 @@
+# Stage 1: Build the SE050 simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+RUN git clone --branch sim-compat --depth 1 \
+    https://github.com/LinuxJedi/nxp-se050.git /app/nxp-se050
+COPY se050-sim/ /app/se050-sim/
+RUN cd /app/se050-sim && cargo build --release --bin tcp_server 2>&1
+
+# ============================================================================
+# Stage 2: SDK (patched with wolfSSL HostCrypto) + wolfSSL + test binary
+#
+# Uses the NXP Plug&Trust v04.07.01 tag, patched with wolfSSL's OSP middleware
+# patch so PTMW_HostCrypto=WOLFSSL is available. This avoids the OpenSSL/wolfSSL
+# header clash that forced --enable-cryptonly on the prior OPENSSL HostCrypto
+# setup, and mirrors what a real wolfSSL+SE050 user deployment looks like.
+#
+# Build order is a three-pass bootstrap (required because wolfSSL-with-SE050
+# links against the SDK and the SDK links against wolfSSL):
+#
+#   Pass-A : wolfSSL without --with-se050  (provides libwolfssl for the SDK)
+#   SDK    : patched, HostCrypto=WOLFSSL   (links against Pass-A wolfSSL)
+#   Pass-B : wolfSSL with --with-se050     (links against patched SDK)
+#   Test   : gcc main.o test.o + final libs
+# ============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git autoconf automake libtool \
+    python3 pkg-config wget curl patch \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/se050-sim/target/release/tcp_server /app/se050-sim-server
+
+# ---- Clone SDK at v04.07.01 and apply wolfSSL OSP patch ----
+WORKDIR /app
+RUN git clone --branch v04.07.01 --depth 1 \
+    https://github.com/NXP/plug-and-trust.git /app/simw-top
+
+RUN curl -fsSL \
+    https://raw.githubusercontent.com/wolfSSL/osp/master/nxp-se05x-middleware/simw-top-v040701.patch \
+    -o /tmp/simw.patch && \
+    cd /app/simw-top && \
+    patch -p1 -l --forward --fuzz=3 < /tmp/simw.patch && \
+    test -f sss/src/wolfssl/fsl_sss_wolfssl_apis.c
+
+# Replace PAL I2C with TCP transport (simulator talks over TCP, not real I2C)
+COPY wolfcrypt-test/i2c_a7.c /app/simw-top/hostlib/hostLib/platform/linux/i2c_a7.c
+
+# Replace GPIO reset with a no-op (no GPIO in Docker)
+COPY wolfcrypt-test/se05x_reset.c /app/simw-top/hostlib/hostLib/platform/rsp/se05x_reset.c
+
+# Enable EC curves the SDK disables by default (NIST-224, Ed25519, etc.)
+COPY wolfcrypt-test/patch_ftr.py /tmp/patch_ftr.py
+RUN python3 /tmp/patch_ftr.py /app/simw-top/fsl_sss_ftr.h && \
+    echo "=== Verify ftr patch ===" && \
+    grep 'SSS_HAVE_EC_NIST_224' /app/simw-top/fsl_sss_ftr.h
+
+# Our CMakeLists builds the SDK sources into the six static libs wolfSSL
+# expects at specific paths under build/. The patched CMakeLists includes
+# sss/src/wolfssl/fsl_sss_wolfssl_apis.c as the HostCrypto backend.
+COPY wolfcrypt-test/CMakeLists.txt /app/simw-top/CMakeLists.txt
+
+# ---- Pass-A: build wolfSSL without SE050 support ----
+# This is the wolfSSL the patched SDK will link against for HostCrypto.
+# WOLFSSL_SE050_NO_TRNG prevents wolfSSL from trying to hit the SE050 TRNG
+# before the SDK is available (per wolfSSL OSP README).
+WORKDIR /app
+RUN git clone --depth 1 https://github.com/wolfSSL/wolfssl.git /app/wolfssl
+
+WORKDIR /app/wolfssl
+RUN ./autogen.sh 2>&1
+RUN ./configure \
+      --enable-keygen \
+      --enable-cmac \
+      CFLAGS="-DWOLFSSL_SE050_NO_TRNG -DSIZEOF_LONG_LONG=8" \
+    2>&1 && \
+    make -j$(nproc) 2>&1 && \
+    make install 2>&1 && \
+    ldconfig
+
+# ---- Build patched SDK with HostCrypto=WOLFSSL ----
+RUN mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS="-fPIC" \
+      -DPTMW_Applet=SE05X_C \
+      -DPTMW_SE05X_Auth=None \
+      -DPTMW_SMCOM=T1oI2C \
+      -DPTMW_HostCrypto=WOLFSSL \
+      -DPTMW_Host=LinuxLike \
+    2>&1 && \
+    cmake --build . -j$(nproc) 2>&1
+
+# Copy fsl_sss_ftr.h to build/ (wolfSSL configure adds -I$dir/build)
+RUN cp /app/simw-top/fsl_sss_ftr.h /app/simw-top/build/
+
+# Verify the six libraries wolfSSL expects are where they need to be.
+RUN ls /app/simw-top/build/sss/libSSS_APIs.a \
+      /app/simw-top/build/sss/ex/src/libex_common.a \
+      /app/simw-top/build/hostlib/hostLib/se05x/libse05x.a \
+      /app/simw-top/build/hostlib/hostLib/liba7x_utils.a \
+      /app/simw-top/build/hostlib/hostLib/libCommon/log/libmwlog.a \
+      /app/simw-top/build/hostlib/hostLib/libCommon/libsmCom.a
+
+# libex_common.a discoverable via -L build/sss
+RUN ln -sf /app/simw-top/build/sss/ex/src/libex_common.a \
+           /app/simw-top/build/sss/libex_common.a
+
+# ---- Pass-B: rebuild wolfSSL with --with-se050 ----
+# Links against the patched SDK we just built. Install overwrites Pass-A.
+WORKDIR /app/wolfssl
+RUN make clean 2>&1 && \
+    ./configure \
+      --with-se050=/app/simw-top \
+      --enable-keygen \
+      --enable-cmac \
+      --enable-cryptocb \
+      --enable-ecc \
+      --enable-ed25519 \
+      --enable-curve25519 \
+      --enable-sha224 \
+      --enable-sha384 \
+      --enable-sha512 \
+      --disable-examples \
+      --enable-crypttests \
+      CFLAGS="-DWOLFSSL_SE050_INIT -DWOLFSSL_SE050_NO_TRNG -DSIZEOF_LONG_LONG=8 \
+              -DECC_USER_CURVES -DHAVE_ECC224 -DHAVE_ECC256 -DHAVE_ECC384" \
+      LDFLAGS="-L/app/simw-top/build" \
+    2>&1 && \
+    make -j$(nproc) 2>&1 && \
+    make install 2>&1 && \
+    ldconfig
+
+# ---- Build our test binary ----
+COPY wolfcrypt-test/main.c /app/wolfcrypt_test_main.c
+
+ENV SDK_INCS="-I/app/wolfssl \
+    -I/app/wolfssl/wolfcrypt/test \
+    -I/app/simw-top \
+    -I/app/simw-top/sss/inc \
+    -I/app/simw-top/sss/ex/inc \
+    -I/app/simw-top/sss/port/default \
+    -I/app/simw-top/hostlib/hostLib/inc \
+    -I/app/simw-top/hostlib/hostLib/libCommon/log \
+    -I/app/simw-top/hostlib/hostLib/libCommon/infra \
+    -I/app/simw-top/hostlib/hostLib/se05x_03_xx_xx \
+    -I/app/simw-top/hostlib/hostLib/platform/inc \
+    -I/app/simw-top/build"
+
+RUN gcc -c -o /tmp/test.o /app/wolfssl/wolfcrypt/test/test.c \
+    -DNO_MAIN_DRIVER -DHAVE_CONFIG_H $SDK_INCS 2>&1
+
+RUN gcc -c -o /tmp/main.o /app/wolfcrypt_test_main.c \
+    -DHAVE_CONFIG_H $SDK_INCS 2>&1
+
+RUN gcc -o /app/wolfcrypt_se050_test /tmp/main.o /tmp/test.o \
+    -L/usr/local/lib \
+    -L/app/simw-top/build/sss \
+    -L/app/simw-top/build/hostlib/hostLib/se05x \
+    -L/app/simw-top/build/hostlib/hostLib \
+    -L/app/simw-top/build/hostlib/hostLib/libCommon/log \
+    -L/app/simw-top/build/hostlib/hostLib/libCommon \
+    -lwolfssl -lSSS_APIs -lex_common -lse05x -la7x_utils -lmwlog -lsmCom \
+    -lpthread -lm \
+    2>&1
+
+# ---- Run test ----
+COPY wolfcrypt-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+CMD ["/app/run_test.sh"]

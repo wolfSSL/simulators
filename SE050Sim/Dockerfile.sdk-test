@@ -1,0 +1,92 @@
+# Stage 1: Build the SE050 simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+RUN git clone --branch sim-compat --depth 1 \
+    https://github.com/LinuxJedi/nxp-se050.git /app/nxp-se050
+COPY se050-sim/ /app/se050-sim/
+RUN cd /app/se050-sim && cargo build --release --bin tcp_server 2>&1
+
+# ============================================================================
+# Stage 2: Build SDK + test program
+# ============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git python3 pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/se050-sim/target/release/tcp_server /app/se050-sim-server
+
+# ---- Build NXP Plug&Trust SDK ----
+WORKDIR /app
+RUN git clone --depth 1 https://github.com/NXP/plug-and-trust.git /app/simw-top
+
+# Replace PAL I2C with TCP transport and no-op reset
+COPY wolfcrypt-test/i2c_a7.c /app/simw-top/hostlib/hostLib/platform/linux/i2c_a7.c
+COPY wolfcrypt-test/se05x_reset.c /app/simw-top/hostlib/hostLib/platform/rsp/se05x_reset.c
+
+# Enable all EC curve features
+COPY wolfcrypt-test/patch_ftr.py /tmp/patch_ftr.py
+RUN python3 /tmp/patch_ftr.py /app/simw-top/fsl_sss_ftr.h
+
+# Disable HOSTCRYPTO_NONE for RSA sign path (must be 0 for EMSA encode)
+RUN sed -i 's/HOSTCRYPTO_NONE 1/HOSTCRYPTO_NONE 0/g' /app/simw-top/fsl_sss_ftr.h && \
+    echo "=== HOSTCRYPTO_NONE ===" && \
+    grep 'define SSS_HAVE_HOSTCRYPTO_NONE' /app/simw-top/fsl_sss_ftr.h
+
+# Build SDK libraries
+COPY wolfcrypt-test/CMakeLists.txt /app/simw-top/CMakeLists.txt
+RUN mkdir -p /app/simw-top/build && cd /app/simw-top/build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS="-fPIC" \
+      -DPTMW_Applet=SE05X_C \
+      -DPTMW_SE05X_Auth=None \
+      -DPTMW_SMCOM=T1oI2C \
+      -DPTMW_HostCrypto=OPENSSL \
+      -DPTMW_Host=LinuxLike \
+    2>&1 && \
+    cmake --build . -j$(nproc) 2>&1
+
+# Copy patched fsl_sss_ftr.h to build/ and ensure HOSTCRYPTO_NONE=0
+RUN cp /app/simw-top/fsl_sss_ftr.h /app/simw-top/build/ && \
+    sed -i 's/SSS_HAVE_HOSTCRYPTO_NONE 1/SSS_HAVE_HOSTCRYPTO_NONE 0/g' /app/simw-top/build/fsl_sss_ftr.h
+
+# Symlink for linker
+RUN ln -sf /app/simw-top/build/sss/ex/src/libex_common.a /app/simw-top/build/sss/libex_common.a
+
+# ---- Build test program ----
+COPY sdk-test/test_se050.c /app/test_se050.c
+COPY sdk-test/test_helpers.h /app/test_helpers.h
+
+RUN gcc -o /app/test_se050 /app/test_se050.c \
+    -I/app \
+    -I/app/simw-top \
+    -I/app/simw-top/sss/inc \
+    -I/app/simw-top/sss/ex/inc \
+    -I/app/simw-top/sss/port/default \
+    -I/app/simw-top/hostlib/hostLib/inc \
+    -I/app/simw-top/hostlib/hostLib/libCommon/log \
+    -I/app/simw-top/hostlib/hostLib/libCommon/infra \
+    -I/app/simw-top/hostlib/hostLib/se05x_03_xx_xx \
+    -I/app/simw-top/hostlib/hostLib/platform/inc \
+    -I/app/simw-top/build \
+    -L/app/simw-top/build/sss \
+    -L/app/simw-top/build/hostlib/hostLib/se05x \
+    -L/app/simw-top/build/hostlib/hostLib \
+    -L/app/simw-top/build/hostlib/hostLib/libCommon/log \
+    -L/app/simw-top/build/hostlib/hostLib/libCommon \
+    -Wl,--start-group \
+    -lSSS_APIs -lex_common -lse05x -la7x_utils -lmwlog -lsmCom \
+    -Wl,--end-group \
+    -lssl -lcrypto \
+    -lpthread -lm \
+    2>&1
+
+# ---- Run test ----
+COPY sdk-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+CMD ["/app/run_test.sh"]

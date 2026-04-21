@@ -1,0 +1,220 @@
+# Stage 1: build the Rust simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY atecc608-sim/ /app/atecc608-sim/
+RUN cd /app/atecc608-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build cryptoauthlib + wolfSSL + test binary
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential autoconf automake libtool cmake git pkg-config \
+    libssl-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/atecc608-sim/target/release/tcp_server /app/atecc608-sim-server
+
+# ---- Build cryptoauthlib (custom HAL; no OpenSSL/I2C backends) ----
+WORKDIR /app
+RUN git clone --branch v3.7.8 --depth 1 \
+    https://github.com/MicrochipTech/cryptoauthlib.git /app/cryptoauthlib
+
+RUN mkdir -p /app/cryptoauthlib/build && cd /app/cryptoauthlib/build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-fPIC" \
+        -DATCA_HAL_CUSTOM=ON \
+        -DATCA_HAL_I2C=OFF \
+        -DATCA_HAL_SPI=OFF \
+        -DATCA_HAL_KIT_UART=OFF \
+        -DATCA_HAL_KIT_HID=OFF \
+        -DATCA_HAL_KIT_BRIDGE=OFF \
+        -DATCA_BUILD_SHARED_LIBS=OFF \
+        -DATCA_OPENSSL=OFF \
+        -DATCA_ATECC608_SUPPORT=ON \
+        -DATCA_PRINTF=ON \
+        2>&1 && \
+    cmake --build . -j$(nproc) 2>&1 && \
+    cmake --install . 2>&1
+
+# cryptoauthlib installs its headers under /usr/include/cryptoauthlib/ (not
+# /usr/local/include), and wolfSSL's atmel.h uses `#include <cryptoauthlib.h>`
+# — without a subdirectory prefix — so expose the headers directly on a
+# default search path.
+RUN cp -r /usr/include/cryptoauthlib/* /usr/include/ && \
+    cp /app/cryptoauthlib/build/lib/atca_config.h /usr/include/atca_config.h
+
+# ---- Build wolfSSL with --enable-cryptauthlib / WOLFSSL_ATECC608A ----
+# No circular dependency: cryptoauthlib doesn't depend on wolfSSL, so a
+# single-pass wolfSSL build against the installed cryptoauthlib is enough.
+RUN git clone --branch v5.9.1-stable --depth 1 \
+    https://github.com/wolfSSL/wolfssl.git /app/wolfssl
+
+# wolfSSL's wolfCrypt_ATECC_SetConfig only copies I2C-specific fields from
+# the passed cfg; when iface_type=ATCA_CUSTOM_IFACE the atcacustom function
+# pointers are silently dropped. Swap the opening XMEMSET for an XMEMCPY so
+# the full struct (including the atcacustom union) is preserved. The
+# subsequent field-by-field assignments are harmless — they overwrite with
+# the same values.
+RUN sed -i '/\/\* copy configuration into our local struct \*\//,/cfg_ateccx08a_i2c_pi\.cfg_data/{s|XMEMSET(&cfg_ateccx08a_i2c_pi, 0, sizeof(cfg_ateccx08a_i2c_pi));|XMEMCPY(\&cfg_ateccx08a_i2c_pi, cfg, sizeof(cfg_ateccx08a_i2c_pi));|}' \
+    /app/wolfssl/wolfcrypt/src/port/atmel/atmel.c && \
+    grep -q 'XMEMCPY(&cfg_ateccx08a_i2c_pi, cfg' /app/wolfssl/wolfcrypt/src/port/atmel/atmel.c
+
+# atmel_set_slot_allocator is declared without WOLFSSL_API, so wolfSSL's
+# default -fvisibility=hidden hides it from libwolfssl.so. Expose it so our
+# test harness can install a round-robin slot allocator (wolfcrypt_test's
+# ECC suite needs multiple concurrent hardware keys).
+RUN sed -i 's|^int atmel_set_slot_allocator|WOLFSSL_API int atmel_set_slot_allocator|' \
+    /app/wolfssl/wolfssl/wolfcrypt/port/atmel/atmel.h \
+    /app/wolfssl/wolfcrypt/src/port/atmel/atmel.c && \
+    grep -q 'WOLFSSL_API int atmel_set_slot_allocator' /app/wolfssl/wolfssl/wolfcrypt/port/atmel/atmel.h
+
+# Fix two guard-mismatch bugs in wolfcrypt/test/test.c that surface with
+# -DWOLFSSL_ATECC608A + --enable-crypttests + -Werror=nested-externs:
+#
+#   1. `ecc_ssh_test` is #if'd out on ATECC at definition time but its
+#      call site only guards on HAVE_ECC_DHE/CRYPTOCELL/CB_ONLY. Extend
+#      the call-site #if so it matches the definition.
+#
+#   2. `ecc_mulmod_test` is compiled on ATECC builds even though it calls
+#      `wc_ecc_mulmod`, whose declaration in wolfssl/wolfcrypt/ecc.h is
+#      hidden behind `!WOLFSSL_ATECC5/608A`. Exclude ATECC from both the
+#      test's definition guard and its call site.
+#
+# These are upstream bugs, worth sending back to wolfSSL.
+RUN python3 - <<'PY'
+import pathlib, sys
+path = pathlib.Path('/app/wolfssl/wolfcrypt/test/test.c')
+src = path.read_text()
+
+def sub(old, new, label):
+    global src
+    if old not in src:
+        sys.exit('patch target not found: ' + label)
+    src = src.replace(old, new, 1)
+
+sub(
+    '    #if defined(HAVE_ECC_DHE) && !defined(WOLFSSL_CRYPTOCELL) && \\\n'
+    '       !defined(WOLF_CRYPTO_CB_ONLY_ECC)\n'
+    '    ret = ecc_ssh_test(key, rng);\n',
+    '    #if defined(HAVE_ECC_DHE) && !defined(WC_NO_RNG) && \\\n'
+    '       !defined(WOLF_CRYPTO_CB_ONLY_ECC) && !defined(WOLFSSL_ATECC508A) && \\\n'
+    '       !defined(WOLFSSL_ATECC608A) && !defined(PLUTON_CRYPTO_ECC) && \\\n'
+    '       !defined(WOLFSSL_CRYPTOCELL)\n'
+    '    ret = ecc_ssh_test(key, rng);\n',
+    'ecc_ssh_test call site',
+)
+
+sub(
+    '#if defined(HAVE_ECC_KEY_IMPORT) && !defined(WOLFSSL_VALIDATE_ECC_IMPORT) && \\\n'
+    '    !defined(WOLFSSL_CRYPTOCELL) && !defined(WOLF_CRYPTO_CB_ONLY_ECC)\n'
+    'static wc_test_ret_t ecc_mulmod_test(ecc_key* key1)\n',
+    '#if defined(HAVE_ECC_KEY_IMPORT) && !defined(WOLFSSL_VALIDATE_ECC_IMPORT) && \\\n'
+    '    !defined(WOLFSSL_CRYPTOCELL) && !defined(WOLF_CRYPTO_CB_ONLY_ECC) && \\\n'
+    '    !defined(WOLFSSL_ATECC508A) && !defined(WOLFSSL_ATECC608A)\n'
+    'static wc_test_ret_t ecc_mulmod_test(ecc_key* key1)\n',
+    'ecc_mulmod_test definition',
+)
+
+sub(
+    '#if defined(HAVE_ECC_KEY_IMPORT) && !defined(WOLFSSL_VALIDATE_ECC_IMPORT) && \\\n'
+    '    !defined(WOLFSSL_CRYPTOCELL)\n'
+    '    ret = ecc_mulmod_test(key);\n',
+    '#if defined(HAVE_ECC_KEY_IMPORT) && !defined(WOLFSSL_VALIDATE_ECC_IMPORT) && \\\n'
+    '    !defined(WOLFSSL_CRYPTOCELL) && !defined(WOLFSSL_ATECC508A) && \\\n'
+    '    !defined(WOLFSSL_ATECC608A)\n'
+    '    ret = ecc_mulmod_test(key);\n',
+    'ecc_mulmod_test call site',
+)
+
+# ecc_test_key_decode / ecc_test_key_gen load fixed private-key test
+# material that ATECC hardware cannot import (only GenKey-produced or
+# explicitly-written keys work). Skip on ATECC builds; genkey/sign/verify
+# coverage elsewhere in wolfcrypt_test picks up the slack.
+# (ecc_test_vector is similarly skipped but via -DNO_ECC_VECTOR_TEST below,
+# which is wolfSSL's own documented off-switch.)
+sub(
+    '#if defined(HAVE_ECC_KEY_IMPORT) && defined(HAVE_ECC_KEY_EXPORT) && \\\n'
+    '    !defined(NO_ASN_CRYPT) && !defined(WC_NO_RNG)\n'
+    '    ret = ecc_test_key_decode(rng, keySize);\n',
+    '#if defined(HAVE_ECC_KEY_IMPORT) && defined(HAVE_ECC_KEY_EXPORT) && \\\n'
+    '    !defined(NO_ASN_CRYPT) && !defined(WC_NO_RNG) && \\\n'
+    '    !defined(WOLFSSL_ATECC508A) && !defined(WOLFSSL_ATECC608A)\n'
+    '    ret = ecc_test_key_decode(rng, keySize);\n',
+    'ecc_test_key_decode call site',
+)
+
+sub(
+    '#if defined(HAVE_ECC_KEY_EXPORT) && !defined(NO_ASN_CRYPT) && !defined(WC_NO_RNG)\n'
+    '    ret = ecc_test_key_gen(rng, keySize);\n',
+    '#if defined(HAVE_ECC_KEY_EXPORT) && !defined(NO_ASN_CRYPT) && !defined(WC_NO_RNG) && \\\n'
+    '    !defined(WOLFSSL_ATECC508A) && !defined(WOLFSSL_ATECC608A)\n'
+    '    ret = ecc_test_key_gen(rng, keySize);\n',
+    'ecc_test_key_gen call site',
+)
+
+# ecc_exp_imp_test exports the device-resident private key, which ATECC
+# hardware doesn't expose. Skip on ATECC builds.
+sub(
+    '#if defined(HAVE_ECC_KEY_IMPORT) && defined(HAVE_ECC_KEY_EXPORT)\n'
+    '    ret = ecc_exp_imp_test(key);\n',
+    '#if defined(HAVE_ECC_KEY_IMPORT) && defined(HAVE_ECC_KEY_EXPORT) && \\\n'
+    '    !defined(WOLFSSL_ATECC508A) && !defined(WOLFSSL_ATECC608A)\n'
+    '    ret = ecc_exp_imp_test(key);\n',
+    'ecc_exp_imp_test call site',
+)
+
+path.write_text(src)
+print('patched test.c')
+PY
+
+# Build wolfSSL as a library only; the test binary has its own curated
+# wolfCrypt-API exercise in main.c.
+RUN cd /app/wolfssl && ./autogen.sh && \
+    ./configure \
+        --with-cryptoauthlib=/usr \
+        --enable-ecc \
+        --enable-sha384 \
+        --enable-sha512 \
+        --enable-keygen \
+        --enable-fastmath \
+        --disable-examples \
+        #--disable-crypttests \
+        CFLAGS="-DWOLFSSL_ATECC608A \
+                -DWOLFSSL_ATECC_NO_ECDH_ENC \
+                -DECC_USER_CURVES -DHAVE_ECC256 \
+                -DNO_ECC_VECTOR_TEST \
+                -Wno-unused-parameter -Wno-implicit-function-declaration \
+                -Wno-nested-externs -Wno-error" \
+    2>&1 && \
+    make -j$(nproc) 2>&1 && \
+    make install 2>&1 && \
+    ldconfig
+
+# ---- Build test binary ----
+COPY wolfcrypt-test/ /app/wolfcrypt-test/
+# Reuse hal_tcp.{c,h} from sdk-test so there's only one HAL source of truth.
+COPY sdk-test/hal_tcp.c /app/wolfcrypt-test/hal_tcp.c
+COPY sdk-test/hal_tcp.h /app/wolfcrypt-test/hal_tcp.h
+
+RUN gcc -o /app/wolfcrypt_atecc_test \
+    /app/wolfcrypt-test/main.c \
+    /app/wolfcrypt-test/hal_tcp.c \
+    /app/wolfssl/wolfcrypt/test/test.c \
+    -DNO_MAIN_DRIVER \
+    -DWOLFSSL_ATECC608A \
+    -DECC_USER_CURVES -DHAVE_ECC256 \
+    -DNO_ECC_VECTOR_TEST \
+    -I/app/wolfcrypt-test \
+    -I/app/wolfssl \
+    -L/usr/local/lib \
+    -lwolfssl -lcryptoauth -lm -lpthread \
+    2>&1
+
+COPY wolfcrypt-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+CMD ["/app/run_test.sh"]

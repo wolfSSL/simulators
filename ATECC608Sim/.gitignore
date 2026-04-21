@@ -1,0 +1,17 @@
+# Build artifacts
+target/
+atecc608-sim/target/
+
+# Runtime state
+atecc608_store.json
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

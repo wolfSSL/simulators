@@ -1,3 +1,24 @@
+/* read_zone.rs
+ *
+ * Copyright (C) 2026 wolfSSL Inc.
+ *
+ * This file is part of ATECC608Sim.
+ *
+ * ATECC608Sim is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * ATECC608Sim is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
 use crate::atca::{self, status, Command};
 use crate::object_store::{zone, Device, CONFIG_SIZE, NUM_SLOTS, OTP_SIZE, SLOT_SIZE};
 
@@ -5,10 +26,10 @@ use crate::object_store::{zone, Device, CONFIG_SIZE, NUM_SLOTS, OTP_SIZE, SLOT_S
 ///
 /// P1 bit 7 set = 32-byte read, clear = 4-byte read.
 /// P1 bits 0-1 = zone (0=config, 1=OTP, 2=data).
-/// P2 (little-endian u16) = address. For config/OTP the address is a byte
-/// offset in 4-byte units: byte_offset = P2 * 4 (but hardware layout uses
-/// the block/offset fields; for v1 we honor byte_offset=P2*4 which matches
-/// how cryptoauthlib's `atcab_read_zone` encodes it for config/OTP reads).
+/// P2 (little-endian u16) = address. For config/OTP, the address uses the
+/// datasheet block/offset encoding: bits 4-3 select the 32-byte block and
+/// bits 2-0 select the 4-byte word within that block. For 32-byte reads,
+/// the word offset is ignored and the whole block is returned.
 /// For data zone: address encodes (slot, block, offset).
 pub fn handle(device: &Device, cmd: &Command) -> Vec<u8> {
     let is_32 = cmd.p1 & 0x80 != 0;

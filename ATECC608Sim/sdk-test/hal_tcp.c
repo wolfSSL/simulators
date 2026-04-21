@@ -1,3 +1,24 @@
+/* hal_tcp.c
+ *
+ * Copyright (C) 2026 wolfSSL Inc.
+ *
+ * This file is part of ATECC608Sim.
+ *
+ * ATECC608Sim is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * ATECC608Sim is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
 /*
  * Custom cryptoauthlib HAL that tunnels ATCA command packets over a TCP
  * socket to the Rust ATECC608A simulator. See hal_tcp.h for the public API.
@@ -28,6 +49,14 @@
 
 static int g_fd = -1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Tracing is enabled only when HAL_TCP_TRACE is set AND non-empty, so that
+ * shell scripts using `export HAL_TCP_TRACE=${HAL_TCP_TRACE:-}` (empty by
+ * default) don't accidentally turn it on. */
+static int trace_enabled(void) {
+    const char *t = getenv("HAL_TCP_TRACE");
+    return t && *t;
+}
 
 static int parse_port(const char *s) {
     if (!s) return DEFAULT_PORT;
@@ -124,7 +153,7 @@ ATCA_STATUS hal_tcp_send(void *iface, uint8_t word_address,
     if (ensure_connected() < 0) { pthread_mutex_unlock(&g_lock); return ATCA_COMM_FAIL; }
     uint8_t wa = word_address;
     ATCA_STATUS st = ATCA_SUCCESS;
-    if (getenv("HAL_TCP_TRACE")) {
+    if (trace_enabled()) {
         fprintf(stderr, "[hal_tcp] SEND word_addr=0x%02X txlen=%d:", word_address, txlength);
         for (int i = 0; i < txlength && i < 32; ++i) fprintf(stderr, " %02X", txdata[i]);
         fprintf(stderr, "\n");
@@ -149,7 +178,7 @@ ATCA_STATUS hal_tcp_receive(void *iface, uint8_t word_address,
     ATCA_STATUS st = ATCA_SUCCESS;
     if (g_fd < 0) st = ATCA_COMM_FAIL;
     else if (read_all(g_fd, rxdata, *rxlength) < 0) st = ATCA_COMM_FAIL;
-    if (getenv("HAL_TCP_TRACE")) {
+    if (trace_enabled()) {
         if (st == ATCA_SUCCESS) {
             fprintf(stderr, "[hal_tcp] RECV rxlen=%u:", (unsigned)*rxlength);
             for (unsigned i = 0; i < *rxlength && i < 80; ++i) fprintf(stderr, " %02X", rxdata[i]);
@@ -164,16 +193,17 @@ ATCA_STATUS hal_tcp_receive(void *iface, uint8_t word_address,
 }
 
 ATCA_STATUS hal_tcp_wake(void *iface) {
+    /* Matches the simulator's wire contract: the wake pulse is silent —
+     * no 4-byte wake response is emitted. cryptoauthlib v3.7+ doesn't
+     * call this path anyway (it drives wake via halsend(0x00) + the next
+     * halreceive), but leave the hook correct for any caller that does. */
     (void)iface;
     pthread_mutex_lock(&g_lock);
     ATCA_STATUS st = ATCA_SUCCESS;
-    if (ensure_connected() < 0) { pthread_mutex_unlock(&g_lock); return ATCA_COMM_FAIL; }
-    uint8_t wake = 0x00;
-    if (write_all(g_fd, &wake, 1) < 0) st = ATCA_COMM_FAIL;
+    if (ensure_connected() < 0) st = ATCA_COMM_FAIL;
     else {
-        uint8_t resp[4];
-        if (read_all(g_fd, resp, sizeof resp) < 0) st = ATCA_COMM_FAIL;
-        else if (!(resp[0] == 0x04 && resp[1] == 0x11)) st = ATCA_WAKE_FAILED;
+        uint8_t wake = 0x00;
+        if (write_all(g_fd, &wake, 1) < 0) st = ATCA_COMM_FAIL;
     }
     pthread_mutex_unlock(&g_lock);
     return st;

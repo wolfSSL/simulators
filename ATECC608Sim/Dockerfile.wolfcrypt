@@ -182,7 +182,6 @@ RUN cd /app/wolfssl && ./autogen.sh && \
         --enable-keygen \
         --enable-fastmath \
         --disable-examples \
-        #--disable-crypttests \
         CFLAGS="-DWOLFSSL_ATECC608A \
                 -DWOLFSSL_ATECC_NO_ECDH_ENC \
                 -DECC_USER_CURVES -DHAVE_ECC256 \

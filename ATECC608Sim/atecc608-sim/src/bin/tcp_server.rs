@@ -1,23 +1,46 @@
+/* tcp_server.rs
+ *
+ * Copyright (C) 2026 wolfSSL Inc.
+ *
+ * This file is part of ATECC608Sim.
+ *
+ * ATECC608Sim is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * ATECC608Sim is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
 /// ATECC608A simulator TCP server.
 ///
-/// Listens for TCP connections (default port 8608, overridable via
-/// `ATECC608_SIM_PORT`). Each connection gets its own `Session` (volatile
-/// TempKey + SHA context), but all connections share the same persisted
-/// `Device` behind an `Arc<Mutex<Store>>`.
+/// Listens for TCP connections (default `127.0.0.1:8608`, overridable via
+/// `ATECC608_SIM_BIND` and `ATECC608_SIM_PORT`). Each connection gets its
+/// own `Session` (volatile TempKey + SHA context), but all connections
+/// share the same persisted `Device` behind an `Arc<Mutex<Store>>`.
 ///
 /// Wire framing on each connection:
 ///   Client -> Server: `[word_addr] ...`
 ///     word_addr 0x03 : command, followed by `count` byte then `count-1`
 ///                      bytes (the rest of the packet including CRC).
-///     word_addr 0x00 : wake pulse. Silent on the protocol level — cryptoauthlib
-///                      v3.7+ interleaves 0x00 with commands and does not
-///                      expect a 4-byte wake response to be produced. Writing
-///                      one would leave stale bytes in the socket for the
-///                      next command. Instead we emit a wake response only
-///                      on the first 0x00 of a fresh connection (some clients
-///                      do expect that initial handshake).
-///     word_addr 0x01 : sleep. Server wipes session state, no response.
-///     word_addr 0x02 : idle. Same as sleep for our purposes.
+///     word_addr 0x00 : wake pulse. Silent on the protocol level —
+///                      cryptoauthlib v3.7+ interleaves 0x00 with commands
+///                      and does not expect a 4-byte wake response.
+///                      Writing one would leave stale bytes in the socket
+///                      that the next command's receive would misparse.
+///                      TempKey / SHA state is preserved across wake.
+///     word_addr 0x01 : sleep. Server wipes per-session volatile state,
+///                      no response.
+///     word_addr 0x02 : idle. Silent, preserves per-session volatile
+///                      state (cryptoauthlib interleaves idle between
+///                      multi-step SHA or Nonce+Sign sub-commands).
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,15 +48,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use atecc608_sim::atca::WAKE_RESPONSE;
 use atecc608_sim::dispatch;
 use atecc608_sim::object_store::Store;
 use atecc608_sim::session::Session;
 
+const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8608;
 const DEFAULT_STORE_PATH: &str = "atecc608_store.json";
 
 fn main() -> io::Result<()> {
+    let bind_addr =
+        env::var("ATECC608_SIM_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let port: u16 = env::var("ATECC608_SIM_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -49,8 +74,8 @@ fn main() -> io::Result<()> {
     };
     let store = Arc::new(Mutex::new(store));
 
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    eprintln!("[atecc608-sim] listening on 0.0.0.0:{port}");
+    let listener = TcpListener::bind((bind_addr.as_str(), port))?;
+    eprintln!("[atecc608-sim] listening on {bind_addr}:{port}");
 
     for conn in listener.incoming() {
         let stream = conn?;
@@ -124,6 +149,8 @@ fn read_and_dispatch(
 
     let mut store = store.lock().unwrap();
     let resp = dispatch(&mut store.device, session, &packet);
-    let _ = store.persist();
+    store
+        .persist()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to persist store: {e}")))?;
     Ok(resp)
 }

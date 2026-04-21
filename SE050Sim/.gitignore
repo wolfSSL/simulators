@@ -1,6 +1,7 @@
 # Build artifacts
 target/
 se050-sim/target/
+Cargo.lock
 
 # Cloned driver (fetched at build time / in Docker)
 nxp-se050/

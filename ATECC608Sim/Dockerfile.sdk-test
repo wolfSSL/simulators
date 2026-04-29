@@ -1,0 +1,66 @@
+# Stage 1: build the Rust simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY atecc608-sim/ /app/atecc608-sim/
+RUN cd /app/atecc608-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build cryptoauthlib + test binary
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/atecc608-sim/target/release/tcp_server /app/atecc608-sim-server
+
+# ---- Build cryptoauthlib ----
+WORKDIR /app
+# Pin to a recent known-working tag. v3.7.8 is the latest as of early 2026.
+RUN git clone --branch v3.7.8 --depth 1 \
+    https://github.com/MicrochipTech/cryptoauthlib.git /app/cryptoauthlib
+
+# We register our HAL at runtime by populating ATCAIfaceCfg.atcacustom, so
+# cryptoauthlib just needs ATCA_HAL_CUSTOM=ON and the other HALs disabled
+# (they pull in libraries we don't have in the container).
+RUN mkdir -p /app/cryptoauthlib/build && cd /app/cryptoauthlib/build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-fPIC" \
+        -DATCA_HAL_CUSTOM=ON \
+        -DATCA_HAL_I2C=OFF \
+        -DATCA_HAL_SPI=OFF \
+        -DATCA_HAL_KIT_UART=OFF \
+        -DATCA_HAL_KIT_HID=OFF \
+        -DATCA_HAL_KIT_BRIDGE=OFF \
+        -DATCA_BUILD_SHARED_LIBS=OFF \
+        -DATCA_OPENSSL=OFF \
+        -DATCA_ATECC608_SUPPORT=ON \
+        -DATCA_PRINTF=ON \
+        2>&1 && \
+    cmake --build . -j$(nproc) 2>&1 && \
+    cmake --install . 2>&1
+
+# ---- Build test binary ----
+COPY sdk-test/ /app/sdk-test/
+
+# We link hal_tcp.c directly into the test binary (cryptoauthlib's CMake
+# compiles a stubbed `hal_custom.c` into the archive but doesn't link
+# user code, so we supply it here ourselves).
+RUN gcc -o /app/test_atecc608 \
+    /app/sdk-test/test_atecc608.c \
+    /app/sdk-test/hal_tcp.c \
+    -I/app/sdk-test \
+    -I/usr/include/cryptoauthlib \
+    -I/app/cryptoauthlib/build/lib \
+    -L/usr/lib \
+    -lcryptoauth -lssl -lcrypto -lpthread \
+    2>&1
+
+COPY sdk-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+CMD ["/app/run_test.sh"]

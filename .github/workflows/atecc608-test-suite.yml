@@ -1,0 +1,26 @@
+name: ATECC608 test suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    name: cargo test (unit + integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ATECC608Sim/atecc608-sim
+
+      - name: cargo test
+        run: |
+          cargo test --manifest-path ATECC608Sim/atecc608-sim/Cargo.toml \
+            -- --test-threads=1

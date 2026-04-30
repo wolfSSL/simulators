@@ -1,0 +1,30 @@
+name: STSAFE-A120 SDK test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  sdk-test:
+    name: STSELib + OpenSSL cross-verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build sdk-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: STSAFEA120Sim
+          file: STSAFEA120Sim/Dockerfile.sdk-test
+          tags: stsafe-a120-sdk-test:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run sdk-test suite
+        run: docker run --rm stsafe-a120-sdk-test:ci

@@ -1,0 +1,155 @@
+# Dockerfile.wolfcrypt
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of STSAFEA120Sim.
+#
+# STSAFEA120Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Stage 1: build the Rust simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY stsafe-a120-sim/ /app/stsafe-a120-sim/
+RUN cd /app/stsafe-a120-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build STSELib + wolfSSL + integration test
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential autoconf automake libtool git pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/stsafe-a120-sim/target/release/tcp_server /app/tcp_server
+
+# ---- STSELib v1.1.7 (open-source A120 middleware) ----
+ARG STSELIB_TAG=v1.1.7
+RUN git clone --branch ${STSELIB_TAG} --depth 1 \
+    https://github.com/STMicroelectronics/STSELib.git /app/STSELib
+
+# ---- PAL + STSELib feature config (reused from sdk-test) ----
+COPY sdk-test/ /app/sdk-test/
+
+# ---- Build STSELib + PAL into a shared library so wolfSSL's link step
+#      can resolve stse_* symbols when stsafe.c is compiled into libwolfssl. ----
+WORKDIR /app/build
+RUN set -eux; \
+    SOURCES=$(find /app/STSELib -name '*.c'); \
+    for src in $SOURCES; do \
+        gcc -c -O2 -fPIC \
+            -include /app/sdk-test/stse_platform_generic.h \
+            -I/app/STSELib \
+            -I/app/sdk-test \
+            -Wno-unused-parameter \
+            -Wno-misleading-indentation \
+            -Wno-unused-but-set-variable \
+            -o "$(basename ${src} .c).o" "${src}"; \
+    done; \
+    gcc -c -O2 -fPIC \
+        -include /app/sdk-test/stse_platform_generic.h \
+        -I/app/STSELib \
+        -I/app/sdk-test \
+        -Wno-unused-parameter \
+        -o pal_tcp.o /app/sdk-test/pal_tcp.c; \
+    gcc -shared -fPIC -o /usr/local/lib/libstse.so *.o; \
+    ldconfig
+
+# ---- wolfSSL with STSAFE-A120 support ----
+ARG WOLFSSL_REF=v5.9.1-stable
+RUN git clone --branch ${WOLFSSL_REF} --depth 1 \
+    https://github.com/wolfSSL/wolfssl.git /app/wolfssl
+
+# wolfSSL's stsafe.c does `#include "stselib.h"`, which pulls in
+# `stse_conf.h` and `stse_platform_generic.h` from the same directory.
+# Inject our paths via CFLAGS so the compile finds them. We also link
+# libstse.so so the stse_* references resolve.
+# Two upstream gaps need patching before STSAFE-A120 will build cleanly:
+#
+#   1. `wolfcrypt/src/port/st/stsafe.c` is in EXTRA_DIST only -- there is
+#      no `if BUILD_STSAFE` clause that adds it to
+#      `src_libwolfssl_la_SOURCES`. As a result, libwolfssl is built
+#      without `stsafe_interface_init`, but wc_port.c references it
+#      under `#ifdef WOLFSSL_STSAFE`, leaving an undefined symbol at
+#      link time.
+#
+#   2. STSELib's `stselib.h` includes `core/stse_platform.h` *before*
+#      `stse_platform_generic.h`, so types like `PLAT_UI8` used inside
+#      `stse_device.h` are undefined when wolfSSL's stsafe.c includes
+#      stselib.h. Force-include the platform header at the top of
+#      stsafe.c to unbreak the include chain.
+#
+# Both worth upstreaming -- one as a build-system fix in include.am,
+# the other as a header-ordering fix in STSELib.
+RUN sed -i \
+    '/^if BUILD_CRYPTOCB$/i \
+src_libwolfssl@LIBSUFFIX@_la_SOURCES += wolfcrypt/src/port/st/stsafe.c\n' \
+    /app/wolfssl/wolfcrypt/src/include.am && \
+    grep -q 'src_libwolfssl@LIBSUFFIX@_la_SOURCES += wolfcrypt/src/port/st/stsafe.c' \
+        /app/wolfssl/wolfcrypt/src/include.am && \
+    sed -i '1i #include "stse_platform_generic.h"' \
+        /app/wolfssl/wolfcrypt/src/port/st/stsafe.c && \
+    head -2 /app/wolfssl/wolfcrypt/src/port/st/stsafe.c
+
+# wolfSSL's stsafe.c does `#include "stselib.h"`, which is the master
+# header that drags in stse_platform_generic.h itself, so we only need
+# the include path -- not a -include directive (the latter trips
+# autoconf's `cannot make gcc report undeclared builtins` check during
+# AC_CHECK_DECLS).
+RUN cd /app/wolfssl && ./autogen.sh && \
+    ./configure \
+        --enable-pkcallbacks \
+        --enable-cryptocb \
+        --enable-ecc \
+        --enable-sha256 \
+        --enable-sha384 \
+        --enable-keygen \
+        --disable-examples \
+        CFLAGS="-DWOLFSSL_STSAFEA120 -DHAVE_PK_CALLBACKS -DWOLF_CRYPTO_CB \
+                -I/app/STSELib -I/app/sdk-test \
+                -Wno-unused-parameter -Wno-error \
+                -Wno-error=strict-prototypes -Wno-error=nested-externs \
+                -Wno-error=missing-prototypes -Wno-error=missing-field-initializers \
+                -Wno-error=unused-but-set-variable -Wno-error=shadow \
+                -Wno-error=missing-noreturn -Wno-error=overflow \
+                -Wno-error=cast-function-type -Wno-error=switch-enum \
+                -Wno-error=pedantic -Wno-error=array-bounds \
+                -Wno-error=undef -Wno-error=incompatible-pointer-types" \
+        LIBS="-lstse" \
+    2>&1 && \
+    make -j$(nproc) 2>&1 && \
+    make install 2>&1 && \
+    ldconfig
+
+# ---- Build integration test program ----
+COPY wolfcrypt-test/ /app/wolfcrypt-test/
+
+# `-include stse_platform_generic.h` is needed here because main.c
+# includes stselib.h directly, and STSELib's master include orders
+# stse_platform_generic.h *after* core/stse_platform.h -- types like
+# `stse_perso_info_t` referenced inside stsafea_commands.h end up
+# undefined without the pre-include. (No autoconf step downstream of
+# this command, so the AC_CHECK_DECLS quirk that bit us during wolfSSL
+# configure does not apply.)
+RUN gcc -O2 -o /app/wolfcrypt_stsafe_test \
+    /app/wolfcrypt-test/main.c \
+    -DWOLFSSL_STSAFEA120 -DHAVE_PK_CALLBACKS -DWOLF_CRYPTO_CB \
+    -include /app/sdk-test/stse_platform_generic.h \
+    -I/app/STSELib \
+    -I/app/sdk-test \
+    -I/usr/local/include \
+    -L/usr/local/lib \
+    -lwolfssl -lstse -lpthread -lm
+
+COPY wolfcrypt-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+ENV STSAFE_SIM_HOST=127.0.0.1
+ENV STSAFE_SIM_PORT=8120
+
+CMD ["/app/run_test.sh"]

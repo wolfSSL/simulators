@@ -1,0 +1,5 @@
+target/
+*.o
+*.a
+*.so
+stsafe_a120_store.json

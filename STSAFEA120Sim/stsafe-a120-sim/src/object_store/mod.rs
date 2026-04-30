@@ -114,8 +114,6 @@ fn fresh_device() -> Device {
         EccSlot {
             curve: CurveKind::NistP256,
             private_key: priv_bytes,
-            usage_limit: 0,
-            used: 0,
         },
     );
 

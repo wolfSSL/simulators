@@ -1,5 +1,9 @@
-#!/bin/sh
+#!/bin/bash
 # run_test.sh
+#
+# bash (not /bin/sh) is required: the readiness probe below uses
+# /dev/tcp, which is a bash builtin. Debian/Ubuntu's /bin/sh is dash
+# and does not support it.
 #
 # Copyright (C) 2026 wolfSSL Inc.
 #

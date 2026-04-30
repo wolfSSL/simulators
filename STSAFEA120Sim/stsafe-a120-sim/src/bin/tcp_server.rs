@@ -29,21 +29,22 @@
 /// Wire framing (no I2C word-address byte -- STSELib drives the bus
 /// directly without ATECC-style 0x00/0x01/0x02/0x03 prefixes):
 ///
-///   Client -> Server (each command frame):
-///     [cmd_header 1B] [length 2B BE] [body...] [crc 2B BE]
-///   Server -> Client:
-///     [rsp_header 1B] [length 2B BE] [body...] [crc 2B BE]
+///   Inner STSAFE frame -- this is what `frame::parse_command` /
+///   `frame::build_response` see, and what `stsafea_frame_transfer.c`
+///   would put on the I2C wire of real silicon:
+///     Client -> Server: [cmd_header 1B (or 2B for ext)] [params...] [crc 2B BE]
+///     Server -> Client: [rsp_header 1B] [length 2B BE] [body...] [crc 2B BE]
+///
+///   Outer TCP framing -- a 2-byte big-endian length prefix wraps the
+///   inner frame in *each* direction so the receiver can read exactly
+///   the right number of bytes per call without parsing the inner
+///   frame's variable-length structure first. This wrapper does not
+///   exist on real silicon; it is purely a TCP transport convenience.
 ///
 /// On the host SDK side, the PAL's `stse_platform_i2c_send_*` family
-/// receives the *frame_length* up front (excluding the length field, but
-/// including CRC) via `BusSendStart`. The PAL serializes that length as a
-/// 2-byte BE prefix on the TCP stream so that the simulator can read the
-/// full command frame without per-call boundary tracking.
-///
-/// Inbound TCP framing on this side: `[length 2B BE] [frame body]` where
-/// `length` covers `[cmd_header...] [crc]`. This bracket is purely a
-/// transport convenience for the TCP socket and does not exist on real
-/// I2C silicon.
+/// gets the inner frame length up front via `BusSendStart` and serializes
+/// it as the 2-byte length prefix; on receive it reads the prefix to size
+/// the inbound `g_rx_buf`.
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};

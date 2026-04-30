@@ -69,7 +69,7 @@ pub fn dispatch(store: &mut Store, session: &mut Session, raw: &[u8]) -> Vec<u8>
         cmd::GENERATE_RANDOM => handlers::random::handle(cmd.body),
         cmd::READ => handlers::read::handle(&store.device, cmd.body),
         cmd::GENERATE_KEY => handlers::keypair::handle(&mut store.device, cmd.body),
-        cmd::GENERATE_SIGNATURE => handlers::sign::handle(&mut store.device, cmd.body),
+        cmd::GENERATE_SIGNATURE => handlers::sign::handle(&store.device, cmd.body),
         cmd::VERIFY_SIGNATURE => handlers::verify::handle(cmd.body),
         cmd::ESTABLISH_KEY => handlers::ecdh::handle(&store.device, cmd.body),
         cmd::QUERY => handlers::query::handle(&store.device, cmd.body),

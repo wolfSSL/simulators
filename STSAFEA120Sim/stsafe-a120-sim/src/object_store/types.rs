@@ -43,15 +43,17 @@ impl CurveKind {
     }
 }
 
-/// A persistent ECC private key slot.
+/// A persistent ECC private key slot. Real silicon also tracks a
+/// `usage_limit` counter that's decremented on every signing/ECDH
+/// operation; the simulator does not model this -- wolfSSL's STSAFE
+/// path always passes `usage_limit = 0` (unlimited), and adding
+/// enforcement would create observable behavior the tests would have
+/// to special-case without exercising any wolfSSL code path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EccSlot {
     pub curve: CurveKind,
     /// Raw 32-byte big-endian scalar.
     pub private_key: Vec<u8>,
-    /// 0 = unlimited, otherwise decremented per signing/ECDH op.
-    pub usage_limit: u16,
-    pub used: u16,
 }
 
 /// A data-zone partition. STSAFE-A120 organises persistent storage as a list

@@ -67,6 +67,21 @@ static int g_run = 0;
         }                                                                        \
     } while (0)
 
+/* For prerequisites: if the call fails, log + return early so the rest
+ * of the test function doesn't run on uninitialised state and crash. */
+#define REQUIRE_OK(label, expr)                                                  \
+    do {                                                                         \
+        g_run++;                                                                 \
+        int _r = (int)(expr);                                                    \
+        if (_r != 0) {                                                           \
+            fprintf(stderr, "[FAIL] %s: rc=%d (skipping rest of test)\n",        \
+                    (label), _r);                                                \
+            g_failures++;                                                        \
+            return -1;                                                           \
+        }                                                                        \
+        fprintf(stdout, "[ OK ] %s\n", (label));                                 \
+    } while (0)
+
 #define EXPECT_TRUE(label, cond)                                                 \
     do {                                                                         \
         g_run++;                                                                 \
@@ -89,7 +104,7 @@ static int init_stse(void) {
 static int rng_smoke_test(void) {
     fprintf(stdout, "\n=== rng_smoke_test ===\n");
     WC_RNG rng;
-    EXPECT_OK("wc_InitRng", wc_InitRng(&rng));
+    REQUIRE_OK("wc_InitRng", wc_InitRng(&rng));
     unsigned char buf1[32], buf2[32];
     EXPECT_OK("wc_RNG_GenerateBlock #1", wc_RNG_GenerateBlock(&rng, buf1, sizeof(buf1)));
     EXPECT_OK("wc_RNG_GenerateBlock #2", wc_RNG_GenerateBlock(&rng, buf2, sizeof(buf2)));
@@ -101,12 +116,29 @@ static int rng_smoke_test(void) {
 static int ecc_p256_round_trip(int devId) {
     fprintf(stdout, "\n=== ecc_p256_round_trip ===\n");
     WC_RNG rng;
-    EXPECT_OK("wc_InitRng (ECC)", wc_InitRng(&rng));
+    REQUIRE_OK("wc_InitRng (ECC)", wc_InitRng(&rng));
 
     ecc_key key;
-    EXPECT_OK("wc_ecc_init_ex", wc_ecc_init_ex(&key, NULL, devId));
-    EXPECT_OK("wc_ecc_make_key (P-256, devId)",
-              wc_ecc_make_key_ex(&rng, 32, &key, ECC_SECP256R1));
+    if (wc_ecc_init_ex(&key, NULL, devId) != 0) {
+        fprintf(stderr, "[FAIL] wc_ecc_init_ex (skipping rest of test)\n");
+        g_run++;
+        g_failures++;
+        wc_FreeRng(&rng);
+        return -1;
+    }
+    g_run++;
+    fprintf(stdout, "[ OK ] wc_ecc_init_ex\n");
+
+    if (wc_ecc_make_key_ex(&rng, 32, &key, ECC_SECP256R1) != 0) {
+        fprintf(stderr, "[FAIL] wc_ecc_make_key (skipping rest of test)\n");
+        g_run++;
+        g_failures++;
+        wc_ecc_free(&key);
+        wc_FreeRng(&rng);
+        return -1;
+    }
+    g_run++;
+    fprintf(stdout, "[ OK ] wc_ecc_make_key (P-256, devId)\n");
 
     unsigned char hash[32];
     for (size_t i = 0; i < sizeof(hash); i++) hash[i] = (unsigned char)i;

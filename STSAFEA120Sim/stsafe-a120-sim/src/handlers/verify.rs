@@ -23,6 +23,10 @@ use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p256::{EncodedPoint, PublicKey};
 
+use crate::handlers::POINT_REPRESENTATION_UNCOMPRESSED;
+
+const P256_DIGEST_SIZE: usize = 32;
+
 use crate::frame::{build_error, build_response, status};
 use crate::handlers::{is_nist_p256, NIST_P256_CURVE_ID};
 
@@ -55,9 +59,14 @@ pub fn handle(body: &[u8]) -> Vec<u8> {
     }
     p += NIST_P256_CURVE_ID.len();
 
-    // Point representation byte
+    // Point representation byte: only uncompressed (0x04) is supported.
+    // Real silicon decompresses on the fly via the extended Decompress
+    // Public Key command, but the simulator does not implement that path.
     if !need(p, 1, body) {
         return build_error(status::LENGTH_ERROR);
+    }
+    if body[p] != POINT_REPRESENTATION_UNCOMPRESSED {
+        return build_error(status::INVALID_PARAMETER);
     }
     p += 1;
 
@@ -85,11 +94,13 @@ pub fn handle(body: &[u8]) -> Vec<u8> {
     if !need(p, msg_len, body) {
         return build_error(status::LENGTH_ERROR);
     }
-    let msg = &body[p..p + msg_len];
-
-    let mut digest = [0u8; 32];
-    let take = msg.len().min(32);
-    digest[..take].copy_from_slice(&msg[..take]);
+    // Same constraint as the Sign handler: wolfSSL/STSELib hand us a
+    // 32-byte P-256 pre-hash. Reject other lengths rather than silently
+    // truncating or zero-padding.
+    if msg_len != P256_DIGEST_SIZE {
+        return build_error(status::INVALID_PARAMETER);
+    }
+    let digest: &[u8; 32] = body[p..p + msg_len].try_into().unwrap();
 
     let encoded = EncodedPoint::from_affine_coordinates(
         (&pubkey[..32]).into(),
@@ -104,7 +115,7 @@ pub fn handle(body: &[u8]) -> Vec<u8> {
     let Ok(signature) = Signature::from_slice(&sig_rs) else {
         return build_response(status::OK, &[0]);
     };
-    let valid = verifying.verify_prehash(&digest, &signature).is_ok();
+    let valid = verifying.verify_prehash(digest, &signature).is_ok();
     build_response(status::OK, &[if valid { 1 } else { 0 }])
 }
 

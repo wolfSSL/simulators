@@ -24,6 +24,7 @@ use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p256::{AffinePoint, EncodedPoint, PublicKey, SecretKey};
 
 use crate::frame::{build_error, build_response, status};
+use crate::handlers::POINT_REPRESENTATION_UNCOMPRESSED;
 use crate::object_store::types::CurveKind;
 use crate::object_store::Device;
 
@@ -45,7 +46,13 @@ pub fn handle(device: &Device, body: &[u8]) -> Vec<u8> {
         return build_error(status::LENGTH_ERROR);
     }
     let slot = body[0];
-    let _point_repr = body[1];
+    // Only uncompressed-affine (0x04) public keys are accepted. The
+    // simulator does not implement the extended Decompress Public Key
+    // command path, so a compressed peer key would otherwise be parsed
+    // as a malformed X||Y blob.
+    if body[1] != POINT_REPRESENTATION_UNCOMPRESSED {
+        return build_error(status::INVALID_PARAMETER);
+    }
     let xlen = u16::from_be_bytes([body[2], body[3]]) as usize;
     if xlen != 32 {
         return build_error(status::INVALID_PARAMETER);

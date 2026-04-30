@@ -48,8 +48,8 @@ pub fn handle(device: &mut Device, body: &[u8]) -> Vec<u8> {
 
     let _attribute_tag = body[0];
     let slot = body[1];
-    let _usage_limit = u16::from_be_bytes([body[2], body[3]]);
-    let _filler = &body[4..6];
+    // [usage_limit 2B BE] [filler 2B] -- both intentionally ignored, see
+    // EccSlot doc for rationale.
     let curve_id = &body[6..];
 
     if !is_nist_p256(curve_id) {
@@ -73,8 +73,6 @@ pub fn handle(device: &mut Device, body: &[u8]) -> Vec<u8> {
         EccSlot {
             curve: CurveKind::NistP256,
             private_key: priv_bytes.to_vec(),
-            usage_limit: _usage_limit,
-            used: 0,
         },
     );
 

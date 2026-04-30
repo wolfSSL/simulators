@@ -1,0 +1,78 @@
+# Dockerfile.sdk-test
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of STSAFEA120Sim.
+#
+# STSAFEA120Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Stage 1: build the Rust simulator TCP server
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY stsafe-a120-sim/ /app/stsafe-a120-sim/
+RUN cd /app/stsafe-a120-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build STSELib + PAL + sdk test binary
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential git pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/stsafe-a120-sim/target/release/tcp_server /app/tcp_server
+
+# ---- Clone STSELib at a pinned tag ----
+# v1.1.7 is the latest published release at the time this Dockerfile was
+# authored; bump explicitly if upstream changes the wire format.
+ARG STSELIB_TAG=v1.1.7
+RUN git clone --branch ${STSELIB_TAG} --depth 1 \
+    https://github.com/STMicroelectronics/STSELib.git /app/STSELib
+
+# ---- Drop in our PAL + headers ----
+COPY sdk-test/ /app/sdk-test/
+
+# ---- Build STSELib + PAL into a single archive ----
+WORKDIR /app/build
+RUN set -eux; \
+    SOURCES=$(find /app/STSELib -name '*.c'); \
+    for src in $SOURCES; do \
+        gcc -c -O2 -fPIC \
+            -include /app/sdk-test/stse_platform_generic.h \
+            -I/app/STSELib \
+            -I/app/sdk-test \
+            -Wno-unused-parameter \
+            -Wno-misleading-indentation \
+            -Wno-unused-but-set-variable \
+            -o "$(basename ${src} .c).o" "${src}"; \
+    done; \
+    gcc -c -O2 -fPIC \
+        -include /app/sdk-test/stse_platform_generic.h \
+        -I/app/STSELib \
+        -I/app/sdk-test \
+        -Wno-unused-parameter \
+        -o pal_tcp.o /app/sdk-test/pal_tcp.c; \
+    ar rcs /app/build/libstse.a *.o
+
+# ---- Build the test program ----
+RUN gcc -O2 -o /app/test_stsafe \
+    /app/sdk-test/test_stsafe.c \
+    -include /app/sdk-test/stse_platform_generic.h \
+    -I/app/STSELib \
+    -I/app/sdk-test \
+    -L/app/build \
+    -lstse -lssl -lcrypto -lpthread
+
+COPY sdk-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+ENV STSAFE_SIM_HOST=127.0.0.1
+ENV STSAFE_SIM_PORT=8120
+
+CMD ["/app/run_test.sh"]

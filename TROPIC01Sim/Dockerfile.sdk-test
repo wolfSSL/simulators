@@ -1,0 +1,53 @@
+# Dockerfile.sdk-test
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of TROPIC01Sim.
+#
+# TROPIC01Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Stage 1: build the Rust simulator TCP server.
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY tropic01-sim/ /app/tropic01-sim/
+RUN cd /app/tropic01-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build libtropic (with mbedTLS v4 CAL + posix/tcp HAL) and our
+# integration test binary that drives it against the simulator.
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git ca-certificates pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/tropic01-sim/target/release/tcp_server /app/tcp_server
+
+# ---- Clone libtropic at a pinned commit ----
+# Pinned to an explicit commit so the simulator's L2/L3 wire-protocol
+# expectations stay reproducible. Bump deliberately if the upstream
+# protocol changes (CHANGELOG.md tracks renames and structural shifts).
+ARG LIBTROPIC_REF=51044cdc2e0aabff42305130b344c5db3136f158
+RUN git clone https://github.com/tropicsquare/libtropic.git /app/libtropic && \
+    git -C /app/libtropic checkout ${LIBTROPIC_REF}
+
+# ---- Drop in our test source as a libtropic example tree ----
+# Easiest way to inherit libtropic's CMake setup (mbedTLS v4 fetch, CAL
+# wiring, posix/tcp HAL) is to live inside `examples/model/`. We borrow
+# the hello_world CMakeLists.txt as a template and swap in our own main.
+COPY sdk-test/ /app/libtropic/examples/model/sim_test/
+WORKDIR /app/libtropic/examples/model/sim_test/build
+RUN cmake .. && make -j$(nproc)
+
+COPY sdk-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+ENV TROPIC01_SIM_HOST=127.0.0.1
+ENV TROPIC01_SIM_PORT=28992
+
+CMD ["/app/run_test.sh"]

@@ -1,0 +1,94 @@
+# Dockerfile.wolfcrypt
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of TROPIC01Sim.
+#
+# TROPIC01Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Stage 1: build the Rust simulator TCP server.
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY tropic01-sim/ /app/tropic01-sim/
+RUN cd /app/tropic01-sim && cargo build --release --bin tcp_server 2>&1
+
+# =============================================================================
+# Stage 2: build libtropic v0.1.0, build wolfSSL --with-tropic01, build
+# Tropic Square's wolfssl-test app, run it against the simulator.
+#
+# Why v0.1.0: wolfSSL's `wolfcrypt/src/port/tropicsquare/tropic01.c` calls
+# `lt_random_get`, `verify_chip_and_start_secure_session`, `CURVE_ED25519`,
+# and `lt_r_mem_data_read(h, slot, buf, size)` (4-arg form). All of these
+# were renamed in libtropic v1.0.0. The wolfSSL port has not been updated
+# upstream, so we pin to the last release that matches its API.
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake git autoconf automake libtool pkg-config \
+    ca-certificates wget python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/tropic01-sim/target/release/tcp_server /app/tcp_server
+
+# ---- Clone libtropic at the v0.1.0 tag matching wolfSSL's port ----
+ARG LIBTROPIC_REF=v0.1.0
+RUN git clone --branch ${LIBTROPIC_REF} --depth 1 \
+    https://github.com/tropicsquare/libtropic.git /app/libtropic
+
+# ---- Build libtropic with trezor_crypto + the v0.1.0 unix_tcp HAL.
+# The HAL bypass: v0.1.0's hal/port/unix/lt_port_unix_tcp.c is exactly
+# the protocol our simulator speaks (TAG_E_SPI_* over TCP at port 28992),
+# so no custom shim is needed. We just point it at our simulator.
+WORKDIR /app/libtropic/build
+RUN cmake -DLT_USE_TREZOR_CRYPTO=1 -DLT_BUILD_TESTS=0 .. && make -j$(nproc) tropic
+
+# ---- Clone + build wolfSSL master with --with-tropic01 ----
+ARG WOLFSSL_REF=master
+RUN git clone --branch ${WOLFSSL_REF} --depth 1 \
+    https://github.com/wolfSSL/wolfssl.git /app/wolfssl
+WORKDIR /app/wolfssl
+# Patch the upstream wolfSSL TROPIC01 port for two known issues:
+#  - It calls `ForceZero` (a non-existent symbol). The library has
+#    `wc_ForceZero`. Both with -Werror=nested-externs the implicit
+#    declaration is fatal, so we sed-fix it.
+#  - It expects libtropic v0.x's `LT_SEPARATE_L3_BUFF` macro to be
+#    defined. We set it to 0 via CFLAGS below.
+RUN sed -i 's/\bForceZero\b/wc_ForceZero/g' \
+    /app/wolfssl/wolfcrypt/src/port/tropicsquare/tropic01.c
+
+RUN ./autogen.sh && \
+    ./configure \
+        --with-tropic01=/app/libtropic \
+        --enable-cryptocb \
+        --enable-ed25519 \
+        --enable-static --disable-shared \
+        --disable-crypttests --disable-examples \
+        CFLAGS="-DWOLFSSL_TROPIC01 -DLT_SEPARATE_L3_BUFF=0" && \
+    make -j$(nproc) && \
+    make install
+
+# ---- Clone Tropic Square's upstream wolfSSL test ----
+ARG TROPIC_TEST_REF=main
+RUN git clone --branch ${TROPIC_TEST_REF} --depth 1 \
+    https://github.com/tropicsquare/tropic01-wolfssl-test.git /app/tropic01-wolfssl-test
+
+# ---- Patch the test's Makefile to use the v0.1.0 unix_tcp HAL instead
+# of the USB dongle HAL (we don't have a USB dongle in CI, just TCP) ----
+WORKDIR /app/tropic01-wolfssl-test
+RUN sed -i 's|lt_port_unix_usb_dongle.c|lt_port_unix_tcp.c|' Makefile && \
+    sed -i 's|^LIBTROPIC_DIR =.*|LIBTROPIC_DIR = /app/libtropic|' Makefile && \
+    make 2>&1
+
+COPY wolfcrypt-test/run_test.sh /app/run_test.sh
+RUN chmod +x /app/run_test.sh
+
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV TROPIC01_SIM_HOST=127.0.0.1
+ENV TROPIC01_SIM_PORT=28992
+
+CMD ["/app/run_test.sh"]

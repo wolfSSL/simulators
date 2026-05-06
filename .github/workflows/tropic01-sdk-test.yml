@@ -1,0 +1,30 @@
+name: TROPIC01 SDK test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  sdk-test:
+    name: libtropic-driven integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build sdk-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: TROPIC01Sim
+          file: TROPIC01Sim/Dockerfile.sdk-test
+          tags: tropic01-sdk-test:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run sdk-test suite
+        run: docker run --rm tropic01-sdk-test:ci

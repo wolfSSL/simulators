@@ -1,0 +1,8 @@
+stm32-sim/target/
+stm32-sim/Cargo.lock
+firmware/**/*.o
+firmware/**/*.elf
+firmware/**/*.map
+firmware/**/build/
+.git/
+.github/

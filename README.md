@@ -22,3 +22,12 @@ STSAFE-A120 that covers the wolfSSL-required STSAFE-A command subset: P-256
 ECDSA, ECDH, RNG, and a slot/zone store with a default device certificate.
 It plugs into ST's open-source STSELib middleware via a custom Linux PAL
 that pipes the I2C transport over TCP.
+
+## STM32Sim
+
+The [STM32Sim](STM32Sim/) is a Unicorn-Engine-based simulator for STM32
+microcontrollers focused on the on-chip cryptographic accelerators
+(CRYP/AES, HASH, RNG, PKA) that wolfSSL uses. It is intended to replace
+the Renode-based CI flow for wolfSSL on STM32 targets and to close the
+gaps Renode has in hardware-crypto modelling (HASH peripheral, full AES
+mode set, PKA).

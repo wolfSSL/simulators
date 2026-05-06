@@ -1,0 +1,100 @@
+# Dockerfile.wolfcrypt
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of STM32Sim.
+#
+# STM32Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Builds the wolfCrypt-on-STM32 firmwares (H753 and U585) that today
+# run under Renode CI, then runs them through stm32-sim instead. The
+# wolfSSL source tree is expected to be mounted at /opt/wolfssl at
+# runtime (the GitHub workflow does `docker run -v $(pwd):/opt/wolfssl
+# ...`). Default CMD runs the H7 firmware; override with
+# `run-wolfcrypt-u5.sh` for U585.
+# Image contents:
+#   - arm-none-eabi-gcc cross toolchain
+#   - CMSIS_5, cmsis-device-h7, STM32CubeH7 v1.11.2 (vendored under /opt)
+#   - cmsis-device-u5, STM32CubeU5 (vendored under /opt)
+#   - stm32-sim runner binary (built from this same repo)
+#   - run-wolfcrypt-h7.sh and run-wolfcrypt-u5.sh entrypoints
+
+# =============================================================================
+# Stage 1: build stm32-sim (Rust)
+# =============================================================================
+FROM rust:1.85-bookworm AS sim-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config clang libclang-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY stm32-sim/ /app/stm32-sim/
+RUN cd /app/stm32-sim && cargo build --release --bin stm32-sim
+
+# =============================================================================
+# Stage 2: cross-toolchain + CMSIS + STM32CubeH7 + stm32-sim
+# =============================================================================
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build python3 git \
+    gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib \
+    wget unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Vendor STM CMSIS + HAL repos into /opt at fixed refs so the image
+# is reproducible. Tags chosen to match the wolfSSL Renode workflow.
+# STM32CubeH7's HAL_Driver is a git submodule; --recurse-submodules
+# pulls it in - without it the build fails with "stm32h7xx_hal.h: No
+# such file or directory".
+RUN git clone --depth 1 \
+        https://github.com/STMicroelectronics/cmsis-device-h7.git \
+        /opt/cmsis-device-h7 \
+ && git clone --depth 1 \
+        https://github.com/STMicroelectronics/cmsis-device-u5.git \
+        /opt/cmsis-device-u5 \
+ && git clone --depth 1 \
+        https://github.com/ARM-software/CMSIS_5.git \
+        /opt/CMSIS_5 \
+ && (git clone --depth 1 --branch v1.11.2 --recurse-submodules \
+        https://github.com/STMicroelectronics/STM32CubeH7.git \
+        /opt/STM32CubeH7 \
+     || (git clone --depth 1 --branch v1.11.2 \
+            https://github.com/STMicroelectronics/STM32CubeH7.git \
+            /opt/STM32CubeH7 \
+         && cd /opt/STM32CubeH7 \
+         && git submodule update --init --recursive --depth 1)) \
+ && (git clone --depth 1 --recurse-submodules \
+        https://github.com/STMicroelectronics/STM32CubeU5.git \
+        /opt/STM32CubeU5 \
+     || (git clone --depth 1 \
+            https://github.com/STMicroelectronics/STM32CubeU5.git \
+            /opt/STM32CubeU5 \
+         && cd /opt/STM32CubeU5 \
+         && git submodule update --init --recursive --depth 1)) \
+ && find /opt/STM32CubeH7 /opt/STM32CubeU5 -name '.git' -prune -exec rm -rf {} + \
+ && rm -rf /opt/cmsis-device-h7/.git /opt/cmsis-device-u5/.git /opt/CMSIS_5/.git
+
+COPY --from=sim-builder /app/stm32-sim/target/release/stm32-sim /usr/local/bin/stm32-sim
+
+# Firmware sources live in this repo (firmware/wolfcrypt-test-{h7,u5}/),
+# not in the wolfSSL tree. That decouples the simulator from any
+# particular wolfSSL renode-test layout and lets us drive HASH and
+# the full AES mode set - which the wolfSSL Renode setup had to
+# disable because Renode could not model them.
+COPY firmware/wolfcrypt-test-h7/ /opt/firmware-h7/
+COPY firmware/wolfcrypt-test-u5/ /opt/firmware-u5/
+
+COPY scripts/run-wolfcrypt-h7.sh /usr/local/bin/run-wolfcrypt-h7.sh
+COPY scripts/run-wolfcrypt-u5.sh /usr/local/bin/run-wolfcrypt-u5.sh
+RUN chmod +x /usr/local/bin/run-wolfcrypt-h7.sh /usr/local/bin/run-wolfcrypt-u5.sh
+
+ENV WOLFSSL_ROOT=/opt/wolfssl
+
+# Default entrypoint runs the H7 wolfCrypt test. Override by passing
+# `run-wolfcrypt-u5.sh` as the command for the U585 build.
+CMD ["run-wolfcrypt-h7.sh"]

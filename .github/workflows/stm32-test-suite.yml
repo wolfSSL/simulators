@@ -1,0 +1,36 @@
+name: STM32Sim test suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    name: cargo test (core + smoke firmware)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arm-none-eabi toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: STM32Sim/stm32-sim
+
+      - name: Build smoke firmware (H7)
+        run: make -C STM32Sim/firmware/smoke-test-h7
+
+      - name: Build smoke firmware (U5)
+        run: make -C STM32Sim/firmware/smoke-test-u5
+
+      - name: cargo test
+        run: cargo test --manifest-path STM32Sim/stm32-sim/Cargo.toml --release

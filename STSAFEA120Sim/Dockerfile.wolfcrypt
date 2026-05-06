@@ -61,40 +61,9 @@ RUN set -eux; \
     ldconfig
 
 # ---- wolfSSL with STSAFE-A120 support ----
-ARG WOLFSSL_REF=v5.9.1-stable
+ARG WOLFSSL_REF=master
 RUN git clone --branch ${WOLFSSL_REF} --depth 1 \
     https://github.com/wolfSSL/wolfssl.git /app/wolfssl
-
-# wolfSSL's stsafe.c does `#include "stselib.h"`, which pulls in
-# `stse_conf.h` and `stse_platform_generic.h` from the same directory.
-# Inject our paths via CFLAGS so the compile finds them. We also link
-# libstse.so so the stse_* references resolve.
-# Two upstream gaps need patching before STSAFE-A120 will build cleanly:
-#
-#   1. `wolfcrypt/src/port/st/stsafe.c` is in EXTRA_DIST only -- there is
-#      no `if BUILD_STSAFE` clause that adds it to
-#      `src_libwolfssl_la_SOURCES`. As a result, libwolfssl is built
-#      without `stsafe_interface_init`, but wc_port.c references it
-#      under `#ifdef WOLFSSL_STSAFE`, leaving an undefined symbol at
-#      link time.
-#
-#   2. STSELib's `stselib.h` includes `core/stse_platform.h` *before*
-#      `stse_platform_generic.h`, so types like `PLAT_UI8` used inside
-#      `stse_device.h` are undefined when wolfSSL's stsafe.c includes
-#      stselib.h. Force-include the platform header at the top of
-#      stsafe.c to unbreak the include chain.
-#
-# Both worth upstreaming -- one as a build-system fix in include.am,
-# the other as a header-ordering fix in STSELib.
-RUN sed -i \
-    '/^if BUILD_CRYPTOCB$/i \
-src_libwolfssl@LIBSUFFIX@_la_SOURCES += wolfcrypt/src/port/st/stsafe.c\n' \
-    /app/wolfssl/wolfcrypt/src/include.am && \
-    grep -q 'src_libwolfssl@LIBSUFFIX@_la_SOURCES += wolfcrypt/src/port/st/stsafe.c' \
-        /app/wolfssl/wolfcrypt/src/include.am && \
-    sed -i '1i #include "stse_platform_generic.h"' \
-        /app/wolfssl/wolfcrypt/src/port/st/stsafe.c && \
-    head -2 /app/wolfssl/wolfcrypt/src/port/st/stsafe.c
 
 # wolfSSL's stsafe.c does `#include "stselib.h"`, which is the master
 # header that drags in stse_platform_generic.h itself, so we only need
@@ -103,6 +72,7 @@ src_libwolfssl@LIBSUFFIX@_la_SOURCES += wolfcrypt/src/port/st/stsafe.c\n' \
 # AC_CHECK_DECLS).
 RUN cd /app/wolfssl && ./autogen.sh && \
     ./configure \
+        --enable-stsafe=a120 \
         --enable-pkcallbacks \
         --enable-cryptocb \
         --enable-ecc \
@@ -110,7 +80,7 @@ RUN cd /app/wolfssl && ./autogen.sh && \
         --enable-sha384 \
         --enable-keygen \
         --disable-examples \
-        CFLAGS="-DWOLFSSL_STSAFEA120 -DHAVE_PK_CALLBACKS -DWOLF_CRYPTO_CB \
+        CFLAGS="-DHAVE_PK_CALLBACKS -DWOLF_CRYPTO_CB \
                 -I/app/STSELib -I/app/sdk-test \
                 -Wno-unused-parameter -Wno-error \
                 -Wno-error=strict-prototypes -Wno-error=nested-externs \

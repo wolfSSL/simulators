@@ -100,8 +100,6 @@ SE050Sim/
 ├── Dockerfile                 Rust driver integration tests
 ├── Dockerfile.sdk-test        SDK test suite (OpenSSL verification)
 ├── Dockerfile.wolfcrypt       wolfCrypt test suite integration
-├── patches/
-│   └── apply.sh               Driver bug patches for nxp-se050
 ├── se050-sim/
 │   ├── Cargo.toml
 │   ├── src/

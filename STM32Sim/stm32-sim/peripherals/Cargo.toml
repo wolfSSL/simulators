@@ -1,0 +1,29 @@
+[package]
+name = "stm32-sim-peripherals"
+description = "MMIO peripheral models (USART, RCC, RNG, CRYP, HASH, PKA) for the wolfSSL STM32 simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stm32-sim-core.workspace = true
+log.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+hex.workspace = true
+
+aes.workspace = true
+cipher.workspace = true
+sha-1.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+digest.workspace = true
+p256.workspace = true
+p384.workspace = true
+rsa.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+aes-gcm.workspace = true

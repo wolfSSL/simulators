@@ -1,0 +1,38 @@
+name: STM32Sim wolfCrypt test (H7)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  wolfcrypt-test:
+    name: wolfCrypt on STM32Sim H753 (replaces Renode)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout simulator-stm32
+        uses: actions/checkout@v4
+        with:
+          path: simulator-stm32
+
+      - name: Checkout wolfSSL
+        uses: actions/checkout@v4
+        with:
+          repository: wolfSSL/wolfssl
+          ref: master
+          path: wolfssl
+
+      - name: Build stm32sim-wolfcrypt image
+        run: |
+          docker build \
+            -t stm32sim-wolfcrypt:ci \
+            -f simulator-stm32/STM32Sim/Dockerfile.wolfcrypt \
+            simulator-stm32/STM32Sim
+
+      - name: Run wolfCrypt test on stm32-sim
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/wolfssl:/opt/wolfssl:ro" \
+            stm32sim-wolfcrypt:ci

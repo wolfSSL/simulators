@@ -105,17 +105,11 @@ cryptoauthlib. `Dockerfile.wolfcrypt` builds:
 
 1. cryptoauthlib with `ATCA_HAL_CUSTOM=ON`, no built-in HALs (our test
    binary links in `hal_tcp.c` directly).
-2. wolfSSL pinned to `v5.9.1-stable` with `--with-cryptoauthlib=/usr`,
+2. wolfSSL `master` with `--with-cryptoauthlib=/usr`,
    `-DWOLFSSL_ATECC608A`, and `-DWOLFSSL_ATECC_NO_ECDH_ENC` (the default
    encrypted-ECDH path still calls a 5-arg `atcab_ecdh_enc` signature
    that newer cryptoauthlib renamed; the plain path works fine).
-3. A small patch to `wolfssl/wolfcrypt/src/port/atmel/atmel.c`: the
-   upstream `wolfCrypt_ATECC_SetConfig()` only copies I2C-specific fields
-   from the passed cfg, silently dropping the `atcacustom` function
-   pointers when `iface_type=ATCA_CUSTOM_IFACE`. The Dockerfile replaces
-   the opening `XMEMSET` with an `XMEMCPY` so the full struct (including
-   the function-pointer union) is preserved.
-4. `--enable-fastmath` is required — the default sp-math backend returns
+3. `--enable-fastmath` is required -- the default sp-math backend returns
    `MP_VAL` on the `mp_read_unsigned_bin(key->pubkey.x, ...)` call inside
    wolfSSL's ATECC keygen path.
 

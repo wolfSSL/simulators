@@ -2,5 +2,5 @@ target/
 *.o
 *.a
 *.so
-stsafe_a120_store.json
+tropic01_store.json
 Cargo.lock

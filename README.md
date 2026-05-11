@@ -42,3 +42,8 @@ the Renode-based CI flow for wolfSSL on STM32 targets and to close the
 gaps Renode has in hardware-crypto modelling (HASH peripheral, full AES
 mode set, PKA).
 
+## License
+
+All simulators in this repository are licensed under the GNU General Public
+License v3.0 or later. See [LICENSE](LICENSE) for the full text.
+

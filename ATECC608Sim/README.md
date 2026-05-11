@@ -135,4 +135,4 @@ sign/verify.
 
 ## License
 
-GPL-3.0-or-later. See `LICENSE`.
+GPL-3.0-or-later. See [../LICENSE](../LICENSE) at the repo root.

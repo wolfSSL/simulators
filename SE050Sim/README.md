@@ -312,4 +312,4 @@ The upstream [imrank03/nxp-se050](https://github.com/imrank03/nxp-se050) Rust dr
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+This project is licensed under the [GNU General Public License v3.0 or later](../LICENSE).

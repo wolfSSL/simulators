@@ -151,5 +151,4 @@ a clean wolfSSL tree mounted, it produces
 
 ## License
 
-GPL-3.0-or-later. See [../LICENSE](../LICENSE) at the repo root or
-inherited from the parent `simulator-stm32` distribution.
+GPL-3.0-or-later. See [../LICENSE](../LICENSE) at the repo root.

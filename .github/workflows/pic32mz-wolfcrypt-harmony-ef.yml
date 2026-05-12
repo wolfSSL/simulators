@@ -1,0 +1,39 @@
+name: PIC32MZSim wolfCrypt test (Harmony, EF)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  wolfcrypt-harmony-ef:
+    name: wolfCrypt on PIC32MZ EF (MPLAB Harmony port)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout simulator
+        uses: actions/checkout@v4
+        with:
+          path: simulator
+
+      - name: Checkout wolfSSL
+        uses: actions/checkout@v4
+        with:
+          repository: wolfSSL/wolfssl
+          ref: master
+          path: wolfssl
+
+      - name: Build pic32mz-wolfcrypt-harmony image
+        run: |
+          docker build \
+            -t pic32mz-wolfcrypt-harmony:ci \
+            -f simulator/PIC32MZSim/Dockerfile.wolfcrypt-harmony \
+            simulator/PIC32MZSim
+
+      - name: Run wolfCrypt test (Harmony, EF)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/wolfssl:/opt/wolfssl:ro" \
+            pic32mz-wolfcrypt-harmony:ci \
+            /app/scripts/run-wolfcrypt-harmony-ef.sh

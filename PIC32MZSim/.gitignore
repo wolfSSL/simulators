@@ -1,0 +1,6 @@
+pic32mz-sim/target/
+pic32mz-sim/Cargo.lock
+firmware/**/*.o
+firmware/**/*.elf
+firmware/**/*.map
+firmware/**/build/

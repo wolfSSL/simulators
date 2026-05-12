@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "peripherals",
+    "chips",
+    "runner-bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["wolfSSL Inc."]
+rust-version = "1.74"
+
+[workspace.dependencies]
+pic32mz-sim-core = { path = "core", version = "0.1.0" }
+pic32mz-sim-peripherals = { path = "peripherals", version = "0.1.0" }
+pic32mz-sim-chips = { path = "chips", version = "0.1.0" }
+
+unicorn-engine = "2.1"
+goblin = { version = "0.8", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
+hex = "0.4"
+
+aes = "0.8"
+cipher = "0.4"
+ctr = "0.9"
+cfb-mode = "0.8"
+ofb = "0.6"
+aes-gcm = "0.10"
+des = "0.8"
+
+sha-1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+digest = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

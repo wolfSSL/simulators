@@ -26,16 +26,17 @@ track on its own schedule.
 ## Architecture
 
 We use [Unicorn Engine](https://www.unicorn-engine.org/) (QEMU-derived)
-for ARM Cortex-M CPU emulation, and provide our own MMIO peripheral
-models in Rust. The repo is a Cargo workspace under
-[`stm32-sim/`](stm32-sim):
+for ARM CPU emulation, and provide our own MMIO peripheral models in
+Rust. The Cortex-M targets boot in Thumb/MCLASS mode; the MP135
+target boots in ARM mode as a Cortex-A7 (with MMU). The repo is a
+Cargo workspace under [`stm32-sim/`](stm32-sim):
 
 ```
 stm32-sim/
   core/          CPU + MMIO bus + ELF loader + Runner
   peripherals/   USART, RCC, RNG, CRYP, HASH, PKA
-  chips/         STM32H753 / STM32U575 / STM32U585 chip configurations
-                 (memory map + peripheral wiring)
+  chips/         STM32H753 / STM32U575 / STM32U585 / STM32MP135 chip
+                 configurations (memory map + peripheral wiring)
   runner-bin/    `stm32-sim` CLI binary
 ```
 
@@ -50,18 +51,26 @@ even though three chips might present three different DIN/HR layouts.
 
 ## Status
 
-Both **STM32H753** (Cortex-M7, HAL v1, no PKA) and **STM32U575**
-(Cortex-M33, HAL v2, PKA v2) chip targets boot, run firmware, and
-drive their on-chip cryptographic peripherals end-to-end:
+**STM32H753** (Cortex-M7, HAL v1, no PKA), **STM32U575/U585**
+(Cortex-M33, HAL v2, PKA v2), and **STM32MP135** (Cortex-A7,
+HAL v2 with the H7-style CRYP block, PKA v2) chip targets all boot,
+run firmware, and drive their on-chip cryptographic peripherals end-
+to-end:
 
-| Peripheral | H7 (v1) | U5 (v2) |
-|------------|---------|---------|
-| USART      | OK      | OK      |
-| RCC        | stub    | stub    |
-| RNG        | OK      | OK      |
-| CRYP/AES   | ECB/CBC/CTR/GCM (HAL-driven) | ECB/CBC/CTR/GCM |
-| HASH       | SHA-1/224/256, MD5 (HAL-driven, hardware HMAC mode supported) | SHA-1/224/256, MD5 |
-| PKA        | n/a     | ECC mul (P-256/P-384), RSA modexp, mod arithmetic |
+| Peripheral | H7 (v1)                          | U5 (v2)            | MP135                                 |
+|------------|----------------------------------|--------------------|---------------------------------------|
+| USART      | OK                               | OK                 | OK (UART4)                            |
+| RCC        | stub                             | stub               | stub                                  |
+| RNG        | OK                               | OK                 | OK (RNG1)                             |
+| CRYP/AES   | ECB/CBC/CTR/GCM (HAL-driven)     | ECB/CBC/CTR/GCM    | ECB/CBC/CTR/GCM (CRYP1, aliased CRYP) |
+| HASH       | SHA-1/224/256, MD5               | SHA-1/224/256, MD5 | SHA-1/224/256, MD5, SHA-384/512, SHA3-224/256/384/512, SHAKE-128/256 (HASH1) |
+| PKA        | n/a                              | ECC mul (P-256/P-384), RSA modexp, mod arithmetic | same as U5 |
+
+The MP135 is bare-metal Cortex-A7 with no internal flash. The firmware
+links at the DDR base (0xC0000000); the simulator maps DDR as plain
+RAM and the ELF loader writes segments straight there, so no DDR_Init
+helper is needed. The firmware enables a flat 1 MiB-section MMU map
+during early boot to mirror the real-hardware path.
 
 The peripheral register adapters are split into `v1.rs` (H7 / HAL v1)
 and `v2.rs` (U5 / HAL v2) modules sharing the same cryptographic
@@ -90,6 +99,7 @@ toolchain:
 ```sh
 make -C firmware/smoke-test-h7
 make -C firmware/smoke-test-u5
+make -C firmware/smoke-test-mp135
 ```
 
 ## Running

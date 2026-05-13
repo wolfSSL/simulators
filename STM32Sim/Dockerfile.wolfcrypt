@@ -9,18 +9,20 @@
 # the Free Software Foundation; either version 3 of the License, or
 # (at your option) any later version.
 
-# Builds the wolfCrypt-on-STM32 firmwares (H753 and U585) that today
-# run under Renode CI, then runs them through stm32-sim instead. The
-# wolfSSL source tree is expected to be mounted at /opt/wolfssl at
-# runtime (the GitHub workflow does `docker run -v $(pwd):/opt/wolfssl
-# ...`). Default CMD runs the H7 firmware; override with
-# `run-wolfcrypt-u5.sh` for U585.
+# Builds the wolfCrypt-on-STM32 firmwares (H753, U585, MP135) that
+# today run under Renode CI, then runs them through stm32-sim
+# instead. The wolfSSL source tree is expected to be mounted at
+# /opt/wolfssl at runtime (the GitHub workflow does
+# `docker run -v $(pwd):/opt/wolfssl ...`). Default CMD runs the H7
+# firmware; override with `run-wolfcrypt-u5.sh` or
+# `run-wolfcrypt-mp135.sh` for the other targets.
 # Image contents:
 #   - arm-none-eabi-gcc cross toolchain
 #   - CMSIS_5, cmsis-device-h7, STM32CubeH7 v1.11.2 (vendored under /opt)
 #   - cmsis-device-u5, STM32CubeU5 (vendored under /opt)
+#   - STM32CubeMP13 (vendored under /opt for the MP135 build)
 #   - stm32-sim runner binary (built from this same repo)
-#   - run-wolfcrypt-h7.sh and run-wolfcrypt-u5.sh entrypoints
+#   - run-wolfcrypt-{h7,u5,mp135}.sh entrypoints
 
 # =============================================================================
 # Stage 1: build stm32-sim (Rust)
@@ -76,7 +78,15 @@ RUN git clone --depth 1 \
             /opt/STM32CubeU5 \
          && cd /opt/STM32CubeU5 \
          && git submodule update --init --recursive --depth 1)) \
- && find /opt/STM32CubeH7 /opt/STM32CubeU5 -name '.git' -prune -exec rm -rf {} + \
+ && (git clone --depth 1 --recurse-submodules \
+        https://github.com/STMicroelectronics/STM32CubeMP13.git \
+        /opt/STM32CubeMP13 \
+     || (git clone --depth 1 \
+            https://github.com/STMicroelectronics/STM32CubeMP13.git \
+            /opt/STM32CubeMP13 \
+         && cd /opt/STM32CubeMP13 \
+         && git submodule update --init --recursive --depth 1)) \
+ && find /opt/STM32CubeH7 /opt/STM32CubeU5 /opt/STM32CubeMP13 -name '.git' -prune -exec rm -rf {} + \
  && rm -rf /opt/cmsis-device-h7/.git /opt/cmsis-device-u5/.git /opt/CMSIS_5/.git
 
 COPY --from=sim-builder /app/stm32-sim/target/release/stm32-sim /usr/local/bin/stm32-sim
@@ -88,13 +98,18 @@ COPY --from=sim-builder /app/stm32-sim/target/release/stm32-sim /usr/local/bin/s
 # disable because Renode could not model them.
 COPY firmware/wolfcrypt-test-h7/ /opt/firmware-h7/
 COPY firmware/wolfcrypt-test-u5/ /opt/firmware-u5/
+COPY firmware/wolfcrypt-test-mp135/ /opt/firmware-mp135/
 
 COPY scripts/run-wolfcrypt-h7.sh /usr/local/bin/run-wolfcrypt-h7.sh
 COPY scripts/run-wolfcrypt-u5.sh /usr/local/bin/run-wolfcrypt-u5.sh
-RUN chmod +x /usr/local/bin/run-wolfcrypt-h7.sh /usr/local/bin/run-wolfcrypt-u5.sh
+COPY scripts/run-wolfcrypt-mp135.sh /usr/local/bin/run-wolfcrypt-mp135.sh
+RUN chmod +x /usr/local/bin/run-wolfcrypt-h7.sh \
+             /usr/local/bin/run-wolfcrypt-u5.sh \
+             /usr/local/bin/run-wolfcrypt-mp135.sh
 
 ENV WOLFSSL_ROOT=/opt/wolfssl
 
 # Default entrypoint runs the H7 wolfCrypt test. Override by passing
-# `run-wolfcrypt-u5.sh` as the command for the U585 build.
+# `run-wolfcrypt-u5.sh` (U585) or `run-wolfcrypt-mp135.sh` (MP135) as
+# the command for the other targets.
 CMD ["run-wolfcrypt-h7.sh"]

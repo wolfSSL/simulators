@@ -36,11 +36,18 @@ its `hal/posix/tcp/` HAL.
 ## STM32Sim
 
 The [STM32Sim](STM32Sim/) is a Unicorn-Engine-based simulator for STM32
-microcontrollers focused on the on-chip cryptographic accelerators
-(CRYP/AES, HASH, RNG, PKA) that wolfSSL uses. It is intended to replace
-the Renode-based CI flow for wolfSSL on STM32 targets and to close the
-gaps Renode has in hardware-crypto modelling (HASH peripheral, full AES
-mode set, PKA).
+microcontrollers and application processors focused on the on-chip
+cryptographic accelerators (CRYP/AES, HASH, RNG, PKA) that wolfSSL
+uses. It is intended to replace the Renode-based CI flow for wolfSSL
+on STM32 targets and to close the gaps Renode has in hardware-crypto
+modelling (HASH peripheral, full AES mode set, PKA). Currently
+supported targets:
+
+- **STM32H753** (Cortex-M7, HAL v1)
+- **STM32U575 / U585** (Cortex-M33 with TrustZone, HAL v2, PKA v2)
+- **STM32MP135** (Cortex-A7 with MMU, runs out of DDR with no
+  internal flash; CRYP1/HASH1/RNG1/PKA modelled, including SHA3 and
+  SHAKE on HASH1)
 
 ## PIC32MZSim
 

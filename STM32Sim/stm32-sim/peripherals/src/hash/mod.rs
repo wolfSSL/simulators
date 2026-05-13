@@ -26,7 +26,8 @@
 
 pub mod v1;
 
-use digest::{Digest, DynDigest};
+use digest::{Digest, DynDigest, InvalidBufferSize};
+use sha3::digest::{ExtendableOutputReset, Reset};
 
 /// `DynDigest` is the dyn-compatible hashing trait but its `box_clone`
 /// drops the `Send` bound. We need both `Send` (so the engine can sit
@@ -51,7 +52,8 @@ where
 fn fresh_hasher(algo: Algo) -> Box<dyn DynDigestSendClone> {
     use md5::Md5;
     use sha1::Sha1;
-    use sha2::{Sha224, Sha256, Sha384, Sha512};
+    use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
+    use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
     match algo {
         Algo::Sha1 => Box::new(Sha1::new()),
         Algo::Md5 => Box::new(Md5::new()),
@@ -59,6 +61,77 @@ fn fresh_hasher(algo: Algo) -> Box<dyn DynDigestSendClone> {
         Algo::Sha256 => Box::new(Sha256::new()),
         Algo::Sha384 => Box::new(Sha384::new()),
         Algo::Sha512 => Box::new(Sha512::new()),
+        Algo::Sha512_224 => Box::new(Sha512_224::new()),
+        Algo::Sha512_256 => Box::new(Sha512_256::new()),
+        Algo::Sha3_224 => Box::new(Sha3_224::new()),
+        Algo::Sha3_256 => Box::new(Sha3_256::new()),
+        Algo::Sha3_384 => Box::new(Sha3_384::new()),
+        Algo::Sha3_512 => Box::new(Sha3_512::new()),
+        // SHAKE is variable-output. Use the same fixed length the MP13
+        // HAL defaults to (16 bytes for SHAKE-128, 32 for SHAKE-256;
+        // see the HASH_DIGEST_SIZE switch in stm32mp13xx_hal_hash.h).
+        Algo::Shake128 => Box::new(ShakeWrapper::<Shake128>::new(16)),
+        Algo::Shake256 => Box::new(ShakeWrapper::<Shake256>::new(32)),
+    }
+}
+
+/// Adapter that exposes a SHAKE-family XOF (variable-output extendable
+/// hash) through the fixed-length `DynDigest` trait so the streaming
+/// engine can drive it without caring about the SHAKE/SHA-3
+/// distinction. The output length is fixed at construction.
+#[derive(Clone)]
+struct ShakeWrapper<S> {
+    inner: S,
+    output_len: usize,
+}
+
+impl<S: Default> ShakeWrapper<S> {
+    fn new(output_len: usize) -> Self {
+        Self { inner: S::default(), output_len }
+    }
+}
+
+impl<S> DynDigest for ShakeWrapper<S>
+where
+    S: Default
+        + sha3::digest::Update
+        + ExtendableOutputReset
+        + Reset
+        + Clone
+        + Send
+        + 'static,
+{
+    fn update(&mut self, data: &[u8]) {
+        sha3::digest::Update::update(&mut self.inner, data);
+    }
+
+    fn finalize_into(self, buf: &mut [u8]) -> Result<(), InvalidBufferSize> {
+        if buf.len() != self.output_len {
+            return Err(InvalidBufferSize);
+        }
+        let mut inner = self.inner;
+        inner.finalize_xof_reset_into(buf);
+        Ok(())
+    }
+
+    fn finalize_into_reset(&mut self, out: &mut [u8]) -> Result<(), InvalidBufferSize> {
+        if out.len() != self.output_len {
+            return Err(InvalidBufferSize);
+        }
+        self.inner.finalize_xof_reset_into(out);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        Reset::reset(&mut self.inner);
+    }
+
+    fn output_size(&self) -> usize {
+        self.output_len
+    }
+
+    fn box_clone(&self) -> Box<dyn DynDigest> {
+        Box::new(self.clone())
     }
 }
 
@@ -68,32 +141,56 @@ pub enum Algo {
     Md5,
     Sha224,
     Sha256,
-    /// U5/H5/H7S only.
+    /// U5/H5/H7S/MP13.
     Sha384,
-    /// U5/H5/H7S only.
+    /// U5/H5/H7S/MP13.
     Sha512,
+    /// MP13/H5/H7S/N6 - SHA-512 truncated to 224 bits with its own IV.
+    Sha512_224,
+    /// MP13/H5/H7S/N6 - SHA-512 truncated to 256 bits with its own IV.
+    Sha512_256,
+    /// MP13 only.
+    Sha3_224,
+    /// MP13 only.
+    Sha3_256,
+    /// MP13 only.
+    Sha3_384,
+    /// MP13 only.
+    Sha3_512,
+    /// MP13 only. Variable-length XOF; the engine fixes the output to
+    /// 16 bytes (the MP13 HAL default for `HASH_DIGEST_SIZE_SHAKE_128`).
+    Shake128,
+    /// MP13 only. Output fixed to 32 bytes.
+    Shake256,
 }
 
 impl Algo {
     pub fn output_words(self) -> usize {
         match self {
-            Algo::Sha1 => 5,     // 160 bit
-            Algo::Md5 => 4,      // 128 bit
-            Algo::Sha224 => 7,   // 224 bit
-            Algo::Sha256 => 8,   // 256 bit
-            Algo::Sha384 => 12,  // 384 bit
-            Algo::Sha512 => 16,  // 512 bit
+            Algo::Sha1 => 5,                       // 160 bit
+            Algo::Md5 | Algo::Shake128 => 4,       // 128 bit
+            Algo::Sha224 | Algo::Sha3_224 | Algo::Sha512_224 => 7, // 224 bit
+            Algo::Sha256 | Algo::Sha3_256 | Algo::Shake256 | Algo::Sha512_256 => 8, // 256 bit
+            Algo::Sha384 | Algo::Sha3_384 => 12,   // 384 bit
+            Algo::Sha512 | Algo::Sha3_512 => 16,   // 512 bit
         }
     }
 
     /// HMAC block size in bytes - the unit at which HMAC pads the
     /// key with `K_pad ⊕ ipad` / `K_pad ⊕ opad`. SHA-384/512 use a
-    /// 1024-bit (128-byte) compression block, the rest use 512-bit
-    /// (64-byte).
+    /// 1024-bit (128-byte) compression block, the SHA-1/2-256 family
+    /// use 512-bit (64-byte), and the SHA-3 / SHAKE rate depends on
+    /// the security level (NIST FIPS-202 Table 3).
     pub fn block_size(self) -> usize {
         match self {
             Algo::Md5 | Algo::Sha1 | Algo::Sha224 | Algo::Sha256 => 64,
-            Algo::Sha384 | Algo::Sha512 => 128,
+            Algo::Sha384 | Algo::Sha512 | Algo::Sha512_224 | Algo::Sha512_256 => 128,
+            Algo::Sha3_224 => 144, // rate r = 1152 bits
+            Algo::Sha3_256 => 136, // rate r = 1088 bits
+            Algo::Sha3_384 => 104, // rate r =  832 bits
+            Algo::Sha3_512 => 72,  // rate r =  576 bits
+            Algo::Shake128 => 168, // rate r = 1344 bits
+            Algo::Shake256 => 136, // rate r = 1088 bits
         }
     }
 }

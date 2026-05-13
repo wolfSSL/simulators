@@ -33,7 +33,7 @@
 
 use anyhow::Result;
 use stm32_sim_core::peripheral::wrap;
-use stm32_sim_core::{Bus, MemoryRegion};
+use stm32_sim_core::{Bus, CpuKind, MemoryRegion};
 use stm32_sim_peripherals::{
     cryp::v2::CrypV2, hash::v1::HashV1, pka::v2::PkaV2, usart::StdoutSink, Dbgmcu, Rcc, Rng, Usart,
 };
@@ -104,6 +104,7 @@ impl crate::ChipBuilder for Stm32U575 {
 
         Ok(Chip {
             name: "stm32u575",
+            cpu_kind: CpuKind::CortexM,
             memory_regions: memory,
             bus,
         })

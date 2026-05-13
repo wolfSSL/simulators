@@ -20,13 +20,15 @@
  */
 
 pub mod stm32h753;
+pub mod stm32mp135;
 pub mod stm32u575;
 
 use anyhow::Result;
-use stm32_sim_core::{Bus, MemoryRegion};
+use stm32_sim_core::{Bus, CpuKind, MemoryRegion};
 
 pub struct Chip {
     pub name: &'static str,
+    pub cpu_kind: CpuKind,
     pub memory_regions: Vec<MemoryRegion>,
     pub bus: Bus,
 }
@@ -40,10 +42,11 @@ pub fn build(name: &str) -> Result<Chip> {
         "stm32h753" => stm32h753::Stm32H753::build(),
         "stm32u575" => stm32u575::Stm32U575::build(),
         "stm32u585" => stm32u575::Stm32U585::build(),
+        "stm32mp135" => stm32mp135::Stm32Mp135::build(),
         other => anyhow::bail!("unknown chip: {other}"),
     }
 }
 
 pub fn list() -> &'static [&'static str] {
-    &["stm32h753", "stm32u575", "stm32u585"]
+    &["stm32h753", "stm32u575", "stm32u585", "stm32mp135"]
 }

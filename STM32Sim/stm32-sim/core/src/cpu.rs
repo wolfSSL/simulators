@@ -22,7 +22,7 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
-use unicorn_engine::{RegisterARM, Unicorn};
+use unicorn_engine::{ArmCpuModel, RegisterARM, Unicorn};
 
 use crate::bus::Bus;
 use crate::elf::{ElfImage, MemoryRegion};
@@ -35,14 +35,45 @@ pub enum CpuStop {
     Fault,
 }
 
+/// CPU family selector. Determines the Unicorn `Mode` flags and whether
+/// the runtime treats addresses as Thumb (M-class) or ARM (A-class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuKind {
+    /// Cortex-M0/M3/M4/M7/M33 - Thumb-2 only, M-profile vector table.
+    CortexM,
+    /// Cortex-A series (A7, A15, ...) - ARMv7-A with MMU support.
+    CortexA,
+}
+
 pub struct Cpu {
     uc: Unicorn<'static, ()>,
+    kind: CpuKind,
 }
 
 impl Cpu {
     pub fn new(memory: &[MemoryRegion]) -> Result<Self> {
-        let mut uc = Unicorn::new(Arch::ARM, Mode::THUMB | Mode::MCLASS)
+        Self::new_with_kind(memory, CpuKind::CortexM)
+    }
+
+    pub fn new_with_kind(memory: &[MemoryRegion], kind: CpuKind) -> Result<Self> {
+        let mode = match kind {
+            CpuKind::CortexM => Mode::THUMB | Mode::MCLASS,
+            // ARMv7-A starts in ARM (not Thumb). No MCLASS flag - that
+            // is the bit that switches Unicorn into M-profile exception
+            // semantics. Without it we get an A-class CPU with MMU,
+            // VFP/NEON, and SVC-mode boot.
+            CpuKind::CortexA => Mode::ARM,
+        };
+        let mut uc = Unicorn::new(Arch::ARM, mode)
             .map_err(|e| anyhow!("Unicorn::new failed: {e:?}"))?;
+        if let CpuKind::CortexA = kind {
+            // The default A-class CPU in Unicorn does not advertise an
+            // MMU or VFPv4/NEON. Pin to Cortex-A7 so MP135 firmware can
+            // enable its translation tables and use VFP/NEON-compiled
+            // wolfSSL code.
+            uc.ctl_set_cpu_model(ArmCpuModel::CORTEX_A7 as i32)
+                .map_err(|e| anyhow!("ctl_set_cpu_model(CORTEX_A7) failed: {e:?}"))?;
+        }
         for region in memory {
             uc.mem_map(region.base, region.size, Prot::ALL)
                 .map_err(|e| {
@@ -55,7 +86,7 @@ impl Cpu {
                     )
                 })?;
         }
-        Ok(Self { uc })
+        Ok(Self { uc, kind })
     }
 
     /// Install a Bus: register one Unicorn MMIO callback per 4 KiB page
@@ -102,7 +133,13 @@ impl Cpu {
                     )
                 })?;
         }
-        let pc = image.entry_point & !1; // strip Thumb bit
+        // The Thumb bit (LSB=1) marks Cortex-M ELF entry points; on
+        // A-class the bit is already 0. Stripping it is safe in both
+        // cases. The SP slot for A-class is also unused: A-class
+        // firmware sets its own stacks from its startup code (one per
+        // exception mode), but writing a reasonable SP is harmless if
+        // the ELF has one.
+        let pc = image.entry_point & !1;
         self.uc
             .reg_write(RegisterARM::SP, image.initial_sp)
             .map_err(|e| anyhow!("reg_write SP: {e:?}"))?;
@@ -112,16 +149,34 @@ impl Cpu {
         Ok(())
     }
 
-    /// Run up to `max_instructions` Thumb instructions, then return.
+    /// Run up to `max_instructions` instructions, then return.
     pub fn run(&mut self, max_instructions: u64) -> Result<CpuStop> {
         let pc = self
             .uc
             .reg_read(RegisterARM::PC)
             .map_err(|e| anyhow!("reg_read PC: {e:?}"))?;
-        // emu_start expects (begin | 1) for Thumb; end=0 means run until count expires.
+        // emu_start expects (begin | 1) when the next instruction is a
+        // Thumb instruction. Cortex-M is always Thumb. Cortex-A toggles
+        // between ARM and Thumb at runtime, so probe CPSR.T (bit 5) for
+        // each slice - resuming with the wrong bit corrupts the decode
+        // and Unicorn reports it as INSN_INVALID at the resume address.
+        let begin = match self.kind {
+            CpuKind::CortexM => pc | 1,
+            CpuKind::CortexA => {
+                let cpsr = self
+                    .uc
+                    .reg_read(RegisterARM::CPSR)
+                    .map_err(|e| anyhow!("reg_read CPSR: {e:?}"))?;
+                if cpsr & (1 << 5) != 0 {
+                    pc | 1
+                } else {
+                    pc & !1
+                }
+            }
+        };
         match self
             .uc
-            .emu_start(pc | 1, 0, 0, max_instructions as usize)
+            .emu_start(begin, 0, 0, max_instructions as usize)
         {
             Ok(()) => Ok(CpuStop::Halted),
             Err(e) => {

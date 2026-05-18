@@ -80,12 +80,13 @@ fn run(args: Args) -> Result<ExitCode> {
         .elf
         .clone()
         .ok_or_else(|| anyhow!("ELF path required (or pass --list-chips)"))?;
-    let image = ElfImage::from_path(&elf_path)
-        .with_context(|| format!("loading {}", elf_path.display()))?;
 
     let chip = stm32_sim_chips::build(&args.chip)?;
 
-    let mut cpu = Cpu::new(&chip.memory_regions)?;
+    let image = ElfImage::from_path_with_kind(&elf_path, chip.cpu_kind)
+        .with_context(|| format!("loading {}", elf_path.display()))?;
+
+    let mut cpu = Cpu::new_with_kind(&chip.memory_regions, chip.cpu_kind)?;
     cpu.ensure_segments_fit(&image, &chip.memory_regions)?;
     cpu.install_bus(chip.bus)?;
     cpu.load_elf(&image)?;

@@ -60,6 +60,17 @@ impl Dbgmcu {
             regs: [0; 256],
         }
     }
+
+    /// STM32MP135: DEV_ID = 0x501, REV_ID = 0x2000 (rev Z). HAL_GetREVID
+    /// is read by HAL_RCC_OscConfig on this part, so the peripheral
+    /// must exist for the HAL to come up.
+    pub fn mp13() -> Self {
+        Self {
+            name: "dbgmcu",
+            idcode: (0x2000 << 16) | 0x501,
+            regs: [0; 256],
+        }
+    }
 }
 
 impl Peripheral for Dbgmcu {

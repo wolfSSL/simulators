@@ -24,6 +24,8 @@ use goblin::elf::{program_header::PT_LOAD, Elf};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::cpu::CpuKind;
+
 #[derive(Debug, Clone)]
 pub struct LoadSegment {
     /// Load address (LMA, ELF `p_paddr`): where the segment's initial
@@ -65,13 +67,21 @@ pub struct ElfImage {
 
 impl ElfImage {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::from_path_with_kind(path, CpuKind::CortexM)
+    }
+
+    pub fn from_path_with_kind<P: AsRef<Path>>(path: P, kind: CpuKind) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read ELF file: {}", path.display()))?;
-        Self::from_bytes(&bytes)
+        Self::from_bytes_with_kind(&bytes, kind)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_kind(bytes, CpuKind::CortexM)
+    }
+
+    pub fn from_bytes_with_kind(bytes: &[u8], kind: CpuKind) -> Result<Self> {
         let elf = Elf::parse(bytes).map_err(|e| anyhow!("failed to parse ELF: {e}"))?;
 
         let mut segments = Vec::new();
@@ -103,21 +113,39 @@ impl ElfImage {
             }
         }
 
-        // Cortex-M boot: vector table starts at the lowest-loaded address;
-        // word 0 = initial SP, word 1 = reset vector (Thumb bit set).
-        let mut initial_sp = 0u64;
-        let mut reset_vec = elf.entry;
-        if let Some(seg) = segments.iter().min_by_key(|s| s.load_address) {
-            if seg.data.len() >= 8 {
-                initial_sp =
-                    u32::from_le_bytes([seg.data[0], seg.data[1], seg.data[2], seg.data[3]]) as u64;
-                reset_vec =
-                    u32::from_le_bytes([seg.data[4], seg.data[5], seg.data[6], seg.data[7]]) as u64;
+        let (entry_point, initial_sp) = match kind {
+            // Cortex-M boot: vector table at the lowest-loaded address;
+            // word 0 = initial SP, word 1 = reset vector (Thumb bit set).
+            CpuKind::CortexM => {
+                let mut initial_sp = 0u64;
+                let mut reset_vec = elf.entry;
+                if let Some(seg) = segments.iter().min_by_key(|s| s.load_address) {
+                    if seg.data.len() >= 8 {
+                        initial_sp = u32::from_le_bytes([
+                            seg.data[0],
+                            seg.data[1],
+                            seg.data[2],
+                            seg.data[3],
+                        ]) as u64;
+                        reset_vec = u32::from_le_bytes([
+                            seg.data[4],
+                            seg.data[5],
+                            seg.data[6],
+                            seg.data[7],
+                        ]) as u64;
+                    }
+                }
+                (reset_vec, initial_sp)
             }
-        }
+            // Cortex-A: the firmware's startup code sets up its own
+            // exception-mode stacks; the linker's entry point is the
+            // ARM-mode reset path (no Thumb bit, no SP-from-vector
+            // convention).
+            CpuKind::CortexA => (elf.entry, 0),
+        };
 
         Ok(Self {
-            entry_point: reset_vec,
+            entry_point,
             initial_sp,
             segments,
             symbols,

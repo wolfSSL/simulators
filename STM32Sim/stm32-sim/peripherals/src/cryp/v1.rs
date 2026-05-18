@@ -259,6 +259,14 @@ impl CrypV1 {
         if self.engine.output_full() {
             sr |= 1 << 3;
         }
+        // CRYP_SR.KEYVALID (bit 7) is MP13-only. The MP13 HAL polls it
+        // after writing the key registers (for every algorithm, but in
+        // practice the AES-192 path is the first to hit it because its
+        // KeyIVConfigSkip default forces a re-load every Encrypt call).
+        // Key validation is instantaneous in the simulator, so report
+        // the key as valid as soon as anything has been written into
+        // the key window.
+        sr |= 1 << 7;
         sr
     }
 }

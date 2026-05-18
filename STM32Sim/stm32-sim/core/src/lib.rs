@@ -26,7 +26,7 @@ pub mod cpu;
 pub mod runner;
 
 pub use bus::{Bus, MmioRegion};
-pub use cpu::{Cpu, CpuStop};
+pub use cpu::{Cpu, CpuKind, CpuStop};
 pub use elf::{ElfImage, MemoryRegion};
 pub use peripheral::{Peripheral, PeripheralRef};
 pub use runner::{ExitCondition, RunOutcome, Runner};

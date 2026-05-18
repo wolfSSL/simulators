@@ -32,5 +32,8 @@ jobs:
       - name: Build smoke firmware (U5)
         run: make -C STM32Sim/firmware/smoke-test-u5
 
+      - name: Build smoke firmware (MP135)
+        run: make -C STM32Sim/firmware/smoke-test-mp135
+
       - name: cargo test
         run: cargo test --manifest-path STM32Sim/stm32-sim/Cargo.toml --release

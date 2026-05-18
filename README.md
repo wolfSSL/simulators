@@ -42,6 +42,19 @@ the Renode-based CI flow for wolfSSL on STM32 targets and to close the
 gaps Renode has in hardware-crypto modelling (HASH peripheral, full AES
 mode set, PKA).
 
+## PIC32MZSim
+
+The [PIC32MZSim](PIC32MZSim/) is a Unicorn-Engine-based simulator for the
+Microchip PIC32MZ EC and EF microcontrollers. It models the on-chip
+Crypto Engine (AES, 3DES, MD5, SHA-1, SHA-256, HMAC) and RNG block that
+wolfSSL drives through its PIC32 hardware-crypto port, plus enough UART
+to surface firmware diagnostics. Both port surfaces are covered:
+`WOLFSSL_MICROCHIP_PIC32MZ` (direct register pokes via `pic32mz-crypt.c`)
+and `MICROCHIP_MPLAB_HARMONY` (via the Harmony 3 crypto driver). The
+firmware cross-compiles with `gcc-mipsel-linux-gnu` plus a stub SFR
+header, sidestepping the proprietary XC32 toolchain so the wolfCrypt
+test suite can run in public CI for the first time.
+
 ## License
 
 All simulators in this repository are licensed under the GNU General Public

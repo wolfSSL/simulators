@@ -1,0 +1,31 @@
+[package]
+name = "pic32mz-sim-peripherals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pic32mz-sim-core.workspace = true
+log.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+aes.workspace = true
+cipher.workspace = true
+ctr.workspace = true
+cfb-mode.workspace = true
+ofb.workspace = true
+aes-gcm.workspace = true
+des.workspace = true
+
+sha-1.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+hmac.workspace = true
+digest.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

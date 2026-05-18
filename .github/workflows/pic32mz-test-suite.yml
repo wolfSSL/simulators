@@ -1,0 +1,37 @@
+name: PIC32MZSim test suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    name: cargo test (core + smoke firmware)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mipsel-linux-gnu cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu \
+            libc6-mipsel-cross build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: PIC32MZSim/pic32mz-sim
+
+      - name: Build smoke firmware (EC)
+        run: make -C PIC32MZSim/firmware/smoke-test-ec
+
+      - name: Build smoke firmware (EF)
+        run: make -C PIC32MZSim/firmware/smoke-test-ef
+
+      - name: cargo test
+        run: cargo test --manifest-path PIC32MZSim/pic32mz-sim/Cargo.toml --release -- --test-threads=1

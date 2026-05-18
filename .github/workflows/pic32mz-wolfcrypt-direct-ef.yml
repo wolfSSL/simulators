@@ -1,0 +1,39 @@
+name: PIC32MZSim wolfCrypt test (direct, EF)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  wolfcrypt-direct-ef:
+    name: wolfCrypt on PIC32MZ EF (direct register port)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout simulator
+        uses: actions/checkout@v4
+        with:
+          path: simulator
+
+      - name: Checkout wolfSSL
+        uses: actions/checkout@v4
+        with:
+          repository: wolfSSL/wolfssl
+          ref: master
+          path: wolfssl
+
+      - name: Build pic32mz-wolfcrypt-direct image
+        run: |
+          docker build \
+            -t pic32mz-wolfcrypt-direct:ci \
+            -f simulator/PIC32MZSim/Dockerfile.wolfcrypt-direct \
+            simulator/PIC32MZSim
+
+      - name: Run wolfCrypt test (EF)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/wolfssl:/opt/wolfssl:ro" \
+            pic32mz-wolfcrypt-direct:ci \
+            /app/scripts/run-wolfcrypt-direct-ef.sh

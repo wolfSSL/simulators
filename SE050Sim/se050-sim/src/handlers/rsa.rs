@@ -118,6 +118,11 @@ pub fn handle_write_rsa_key(
         }
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let object_existed = store.exists(&obj_id);
 
     let size_bits_opt = match tlv::find_tlv(&tlvs, TAG_2) {
         Some(t) if t.value.len() == 2 => {
@@ -139,6 +144,29 @@ pub fn handle_write_rsa_key(
     let has_any_component = comp_p.is_some() || comp_q.is_some() || comp_dp.is_some()
         || comp_dq.is_some() || comp_qinv.is_some() || comp_e.is_some()
         || comp_d.is_some() || comp_n.is_some();
+
+    // A private-key import is a sequence of component APDUs. Missing WRITE
+    // permission must not interrupt that creation transaction, but it does
+    // deny a later replacement once a usable key has been materialized (or a
+    // public-only N+E set is complete).
+    let creation_in_progress = has_any_component && match store.get(&obj_id) {
+        Some(SecureObject::RSAKeyPair { private_key_der, staged, .. }) => {
+            if !private_key_der.is_empty() {
+                false
+            } else if apdu.key_type() == P1_PUBLIC_KEY {
+                staged.n.is_none() || staged.e.is_none()
+            } else {
+                staged.n.is_none() || staged.e.is_none() || staged.d.is_none()
+            }
+        }
+        _ => false,
+    };
+    if object_existed
+        && !creation_in_progress
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Keygen: size-only APDU, no component data — generate fresh.
     if !has_any_component {
@@ -168,6 +196,9 @@ pub fn handle_write_rsa_key(
                 staged: RsaComponents::default(),
             },
         );
+        if !object_existed {
+            store.set_creation_metadata(obj_id, creation_policy, 0x02);
+        }
         return ApduResponse::success();
     }
 
@@ -205,6 +236,9 @@ pub fn handle_write_rsa_key(
             staged,
         },
     );
+    if !object_existed {
+        store.set_creation_metadata(obj_id, creation_policy, 0x01);
+    }
     ApduResponse::success()
 }
 

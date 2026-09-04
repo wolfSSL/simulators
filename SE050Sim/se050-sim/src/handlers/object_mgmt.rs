@@ -51,6 +51,7 @@ pub fn handle_read(apdu: &ParsedApdu, store: &mut ObjectStore, v7: bool) -> Apdu
         P2_SIZE => handle_read_size(apdu, store),
         P2_LIST => handle_read_id_list(apdu, store, v7),
         P2_TYPE => handle_read_type(apdu, store, v7),
+        P2_ATTRIBUTES => handle_read_attributes(apdu, store, v7),
         _ => ApduResponse::error(SW_WRONG_P1P2),
     }
 }
@@ -91,7 +92,7 @@ fn handle_write_binary(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespon
 
     for tlv in &tlvs {
         match tlv.tag {
-            TAG_POLICY => {} // Skip policy
+            TAG_POLICY => {}
             TAG_1 if obj_id.is_none() && tlv.value.len() == 4 => {
                 let mut id = [0u8; 4];
                 id.copy_from_slice(&tlv.value);
@@ -114,6 +115,16 @@ fn handle_write_binary(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespon
         Some(id) => id,
         None => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let object_existed = store.exists(&obj_id);
+    if object_existed
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     let write_data = data.unwrap_or_default();
 
@@ -139,6 +150,7 @@ fn handle_write_binary(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespon
             let mut full = vec![0u8; size];
             full[offset..offset + write_data.len()].copy_from_slice(&write_data);
             store.insert(obj_id, SecureObject::Binary { data: full });
+            store.set_creation_metadata(obj_id, creation_policy, 0x01);
             ApduResponse::success()
         }
     }
@@ -159,6 +171,10 @@ fn handle_write_counter(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespo
         Some(id) => id,
         None => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
 
     let size_tlv = tlv::find_tlv(&tlvs, TAG_2)
         .filter(|t| t.value.len() == 2)
@@ -176,6 +192,11 @@ fn handle_write_counter(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespo
         Some(_) => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
         None => None,
     };
+    if existing.is_some()
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     match (existing, size_tlv, value_tlv) {
         // CreateCounter (optionally with an initial value)
@@ -187,6 +208,7 @@ fn handle_write_counter(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespo
                 value: value.unwrap_or(0),
                 size,
             });
+            store.set_creation_metadata(obj_id, creation_policy, 0x01);
             ApduResponse::success()
         }
         // SetCounterValue on an existing counter
@@ -220,6 +242,9 @@ fn handle_read_object(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespons
         Some(id) => id,
         None => return ApduResponse::error(SW_WRONG_DATA),
     };
+    if !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_READ) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
 
     // Optional offset from Tag2 and length from Tag3
     let offset = tlv::find_tlv(&tlvs, TAG_2)
@@ -389,6 +414,49 @@ fn handle_read_type(apdu: &ParsedApdu, store: &mut ObjectStore, v7: bool) -> Apd
     }
 }
 
+/// Applet 7.2 object attribute layout for a non-authentication object:
+/// id, type, auth indicator, AEAD tag length, owner auth ID, RFU, policy,
+/// origin and object version. Applet 3.1.1 rejects this command.
+fn handle_read_attributes(
+    apdu: &ParsedApdu,
+    store: &mut ObjectStore,
+    v7: bool,
+) -> ApduResponse {
+    if !v7 {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let tlvs = match apdu.parse_tlvs() {
+        Ok(t) => t,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let obj_id = match extract_object_id(&tlvs) {
+        Some(id) => id,
+        None => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let Some(object) = store.get(&obj_id) else {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    };
+
+    let mut attributes = Vec::new();
+    attributes.extend_from_slice(&obj_id);
+    attributes.push(object.type_code(true));
+    attributes.push(0x01); // kSE05x_SetIndicator_NOT_SET
+    attributes.extend_from_slice(&[0x00, 0x00]); // minimum AEAD tag length
+    attributes.extend_from_slice(&[0x00; 4]); // owner: unauthenticated session
+    attributes.extend_from_slice(&[0x00, 0x00]); // RFU
+    if let Some(metadata) = store.metadata(&obj_id) {
+        if let Some(policy) = &metadata.policy {
+            attributes.extend_from_slice(policy);
+        }
+        attributes.push(metadata.origin);
+    } else {
+        attributes.push(0x01); // legacy store: treat as externally created
+    }
+    attributes.extend_from_slice(&[0x00; 4]); // object version
+
+    ApduResponse::success_with_tlvs(&[Tlv::new(TAG_3, &attributes)])
+}
+
 fn handle_check_exists(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let tlvs = match apdu.parse_tlvs() {
         Ok(t) => t,
@@ -414,6 +482,10 @@ fn handle_delete(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
         Some(id) => id,
         None => return ApduResponse::error(SW_WRONG_DATA),
     };
+
+    if !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_DELETE) {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Deleting a nonexistent object fails 0x6985 (bench-verified on
     // applet 3.1.1 and 7.2.0; the SDK's erase-before-create pattern
@@ -577,6 +649,89 @@ mod lifecycle_tests {
         body.extend_from_slice(data);
         ParsedApdu { cla: 0x80, ins: INS_WRITE, p1: P1_BINARY, p2: P2_DEFAULT,
                      data: body, le: None }
+    }
+
+    fn attach_policy(apdu: &mut ParsedApdu, header: u32) -> Vec<u8> {
+        let mut raw = vec![0x08];
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&header.to_be_bytes());
+        let mut policy_tlv = vec![TAG_POLICY, raw.len() as u8];
+        policy_tlv.extend_from_slice(&raw);
+        policy_tlv.extend_from_slice(&apdu.data);
+        apdu.data = policy_tlv;
+        raw
+    }
+
+    #[test]
+    fn test_policy_denies_overwrite_and_delete_when_permissions_are_missing() {
+        let mut store = ObjectStore::new();
+        let no_write_id = [0x7F, 0, 0, 0x31];
+        let no_delete_id = [0x7F, 0, 0, 0x32];
+
+        let mut create = write_binary_apdu(no_write_id, 0, Some(4), &[1, 2, 3, 4]);
+        attach_policy(
+            &mut create,
+            crate::policy::POLICY_OBJ_ALLOW_READ
+                | crate::policy::POLICY_OBJ_ALLOW_DELETE,
+        );
+        assert_eq!(handle_write(&create, &mut store).sw, SW_NO_ERROR);
+        let overwrite = write_binary_apdu(no_write_id, 0, Some(4), &[9, 9, 9, 9]);
+        assert_eq!(
+            handle_write(&overwrite, &mut store).sw,
+            SW_CONDITIONS_NOT_SATISFIED
+        );
+        match store.get(&no_write_id) {
+            Some(SecureObject::Binary { data }) => assert_eq!(data, &[1, 2, 3, 4]),
+            _ => panic!("binary object missing"),
+        }
+
+        let mut create = write_binary_apdu(no_delete_id, 0, Some(4), &[5, 6, 7, 8]);
+        attach_policy(
+            &mut create,
+            crate::policy::POLICY_OBJ_ALLOW_READ
+                | crate::policy::POLICY_OBJ_ALLOW_WRITE,
+        );
+        assert_eq!(handle_write(&create, &mut store).sw, SW_NO_ERROR);
+        let delete = tag1_apdu(
+            INS_MGMT,
+            P1_DEFAULT,
+            P2_DELETE_OBJECT,
+            no_delete_id,
+        );
+        assert_eq!(
+            handle_mgmt(&delete, &mut store).sw,
+            SW_CONDITIONS_NOT_SATISFIED
+        );
+        assert!(store.exists(&no_delete_id));
+    }
+
+    #[test]
+    fn test_read_attributes_returns_raw_policy_and_origin_on_v7() {
+        let id = [0x7F, 0, 0, 0x33];
+        let mut store = ObjectStore::new();
+        let mut create = write_binary_apdu(id, 0, Some(3), &[1, 2, 3]);
+        let raw_policy = attach_policy(
+            &mut create,
+            crate::policy::POLICY_OBJ_ALLOW_READ
+                | crate::policy::POLICY_OBJ_ALLOW_DELETE,
+        );
+        assert_eq!(handle_write(&create, &mut store).sw, SW_NO_ERROR);
+
+        let read = tag1_apdu(INS_READ, P1_DEFAULT, P2_ATTRIBUTES, id);
+        let response = handle_read(&read, &mut store, true);
+        assert_eq!(response.sw, SW_NO_ERROR);
+        let tlvs = crate::tlv::parse_tlvs(&response.data).unwrap();
+        let attributes = &tlv::find_tlv(&tlvs, TAG_3).unwrap().value;
+        assert_eq!(&attributes[0..4], &id);
+        assert_eq!(attributes[4], 0x0B);
+        assert_eq!(&attributes[14..14 + raw_policy.len()], &raw_policy);
+        assert_eq!(attributes[14 + raw_policy.len()], 0x01);
+        assert_eq!(attributes.len(), 14 + raw_policy.len() + 1 + 4);
+
+        assert_eq!(
+            handle_read(&read, &mut store, false).sw,
+            SW_CONDITIONS_NOT_SATISFIED
+        );
     }
 
     #[test]

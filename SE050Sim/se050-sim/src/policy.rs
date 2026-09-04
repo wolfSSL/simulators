@@ -19,19 +19,35 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
-//! Minimal model of SE05x secure object policies.
+//! Model of SE05x secure object policies used by object management.
 //!
 //! Covers only what the strict applet 7.2 ECDH derive-target contract
 //! needs: a TAG_POLICY TLV attached to an object creation is a sequence
 //! of entries `length(1) | authObjectId(4) | AR header(4, big endian) |
 //! extension...` (see se05x_const.h in the Plug & Trust middleware, where
 //! DEFAULT_OBJECT_POLICY_SIZE = 8 covers authObjectId + AR header), and
-//! ReadObject on a symmetric key object is refused unless the policy
-//! grants POLICY_OBJ_ALLOW_READ.
+//! The applet uses default-deny semantics once a policy is attached.
 
 /// POLICY_OBJ_ALLOW_READ bit of the 4-byte object policy AR header,
 /// per se05x_const.h in the Plug & Trust middleware.
 pub const POLICY_OBJ_ALLOW_READ: u32 = 0x0020_0000;
+pub const POLICY_OBJ_ALLOW_WRITE: u32 = 0x0010_0000;
+pub const POLICY_OBJ_ALLOW_DELETE: u32 = 0x0004_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPolicy;
+
+/// Validate and copy the optional TAG_POLICY from a parsed command.
+pub fn creation_policy(
+    tlvs: &[crate::tlv::Tlv],
+) -> Result<Option<Vec<u8>>, InvalidPolicy> {
+    match crate::tlv::find_tlv(tlvs, crate::tlv::TAG_POLICY) {
+        Some(tlv) if tlv.value.is_empty() => Ok(None),
+        Some(tlv) if ar_header_union(&tlv.value).is_some() => Ok(Some(tlv.value.clone())),
+        Some(_) => Err(InvalidPolicy),
+        None => Ok(None),
+    }
+}
 
 /// Extract the union of all AR headers from a TAG_POLICY TLV value.
 ///

@@ -18,6 +18,8 @@ A software simulator for the NXP SE050 secure element, implementing the full I2C
 - Persistent object store (JSON file on disk)
 - WriteBinary, ReadObject, CheckObjectExists, DeleteSecureObject
 - ReadIDList, ReadType, ReadSize
+- Per-object access policies, including read, write, delete, use, and secure-channel requirements
+- ReadObjectAttributes policy and origin reporting
 - UserID, Counter objects
 - Crypto object lifecycle (Create, List, Delete)
 - EC public key import and verification
@@ -46,7 +48,7 @@ docker build -f Dockerfile.sdk-test -t se050-sim-sdk-test .
 docker run se050-sim-sdk-test
 ```
 
-This tests the simulator through the NXP Plug&Trust SDK's SSS API, with independent verification using OpenSSL. **All 18 tests pass.** See [SDK Test Suite](#sdk-test-suite) for details.
+This tests the simulator through the NXP Plug&Trust SDK's SSS API, with independent verification using OpenSSL. **All 32 tests pass.** See [SDK Test Suite](#sdk-test-suite) for details.
 
 ### Run the wolfCrypt test suite
 
@@ -133,6 +135,7 @@ SE050Sim/
     ├── i2c_a7.c               Custom PAL: TCP socket transport
     ├── se05x_reset.c           No-op reset stub for Docker
     ├── main.c                  wolfCrypt test wrapper with SE050 init
+    ├── test_api_improvements.c Focused policy/session/SCP03 API smoke test
     ├── CMakeLists.txt          SDK library build
     ├── patch_ftr.py            Enable EC curve features in SDK
     └── run_test.sh             Test runner script
@@ -144,7 +147,7 @@ The simulator has an independent test suite that uses the NXP Plug&Trust SDK's S
 
 ### Test results
 
-All 30 tests pass:
+All 32 tests pass:
 
 | Test | Description |
 |------|-------------|
@@ -329,9 +332,15 @@ over the secure channel against the simulator in CI (`sdk-test-scp03` and
   `--build-arg SE05X_AUTH=PlatfSCP03` (default `None` keeps plain mode).
 - `SetPlatformSCPRequest` is modelled: setting SCP_REQUIRED inside a session
   makes plain commands fail 0x6985 (persisted).
+- GlobalPlatform PUT KEY is modelled for platform SCP03 key rotation. It must
+  be sent through an active secure channel targeting the NXP Supplementary
+  Security Domain; an applet-targeted PUT KEY returns `0x6A80`, matching the
+  hardware. The simulator unwraps the ENC/MAC/DEK values with the current DEK,
+  checks each supplied KCV, and persists the new key set for subsequent
+  connections. The wolfSSL API-improvement smoke test exercises both
+  explicit-key and HKDF-seed rotation, then reconnects with the new keys.
 
-Not modelled: SCP02, ECKey / AppletSCP03 authenticated sessions, and PUT KEY
-(key rotation).
+Not modelled: SCP02 and ECKey / AppletSCP03 authenticated sessions.
 
 ### Implementation notes (worth knowing before you change this code)
 
@@ -376,6 +385,9 @@ these; treat them as required coverage, not a nice-to-have.
 
 - The `SE050_SIM_SCP03_ENC/_MAC` static keys default to well-known NXP
   development keys; do not treat a simulated SCP03 channel as confidential.
+- The persisted simulator state contains the active platform SCP03 keys in
+  plaintext. This is intentional for test reproducibility and is not a model
+  for production key storage.
 
 ## License
 

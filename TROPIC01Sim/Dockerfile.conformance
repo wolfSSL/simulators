@@ -1,0 +1,47 @@
+# Dockerfile.conformance
+#
+# Copyright (C) 2026 wolfSSL Inc.
+#
+# This file is part of TROPIC01Sim.
+#
+# TROPIC01Sim is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+
+# Runs the conformance probe (conformance/tr01_conf.c) against a fresh
+# simulator and compares the result with the output recorded on a real
+# TROPIC01 (conformance/baseline/). See HARDWARE_VALIDATION.md.
+
+# Stage 1: build the Rust simulator TCP server.
+FROM rust:1.85-bookworm AS sim-builder
+
+WORKDIR /app
+COPY tropic01-sim/ /app/tropic01-sim/
+RUN cd /app/tropic01-sim && cargo build --release --bin tcp_server 2>&1
+
+# Stage 2: build the probe (libtropic + wolfCrypt CAL + posix/tcp HAL).
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    build-essential git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sim-builder /app/tropic01-sim/target/release/tcp_server /app/tcp_server
+
+# The libtropic release the baseline was recorded with (v4.2.0)
+ARG LIBTROPIC_REF=9085ea5387a8a1d5a946c7e4f633c7134e4909a7
+RUN git clone https://github.com/tropicsquare/libtropic.git /app/libtropic && \
+    git -C /app/libtropic checkout ${LIBTROPIC_REF}
+
+ARG WOLFSSL_REF=v5.9.4-stable
+RUN git clone --branch ${WOLFSSL_REF} --depth 1 \
+    https://github.com/wolfSSL/wolfssl.git /app/wolfssl
+
+COPY conformance/ /app/conformance/
+RUN make -C /app/conformance -j$(nproc) \
+        LIBTROPIC_DIR=/app/libtropic WOLFSSL_DIR=/app/wolfssl && \
+    chmod +x /app/conformance/run.sh
+
+WORKDIR /app
+CMD ["/app/conformance/run.sh", "/app/tcp_server", "/app/conformance/build/tr01_conf"]

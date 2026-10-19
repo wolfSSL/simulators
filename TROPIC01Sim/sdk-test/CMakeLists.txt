@@ -52,5 +52,11 @@ add_subdirectory("${PATH_LIBTROPIC}/hal/posix/tcp" "posix_tcp_hal")
 target_sources(tropic PRIVATE ${LT_HAL_SRCS})
 target_include_directories(tropic PUBLIC ${LT_HAL_INC_DIRS})
 
+# OpenSSL is used for host-side Ed25519 verify only. The mbedTLS v4 PSA
+# profile libtropic's CAL fetches does not include PSA_ALG_PURE_EDDSA,
+# so we lean on OpenSSL's EVP_DigestVerify for that one curve. P-256
+# verify still uses PSA crypto.
+find_package(OpenSSL REQUIRED)
+
 add_executable(${CMAKE_PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/test_tropic01.c)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE tropic)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE tropic OpenSSL::Crypto)

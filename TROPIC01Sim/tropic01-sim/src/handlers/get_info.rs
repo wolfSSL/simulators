@@ -19,125 +19,165 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
-/// L2 GET_INFO (REQ_ID = 0x01). Wire layout from
-/// `lt_l2_api_structs.h::lt_l2_get_info_req_t`:
-///
-///   [object_id (1B)] [block_index (1B)]
-///
-/// `object_id` selects which artefact to return:
-///   0x00 X509_CERTIFICATE -- chip cert (block_index addresses 128B chunks)
-///   0x01 CHIP_ID
-///   0x02 RISCV_FW_VERSION
-///   0x04 SPECT_FW_VERSION
-///   0xB0 FW_BANK (start-up mode only; not modelled)
-///
-/// All return data lands in `[STATUS=REQUEST_OK][RSP_LEN][object][CRC]`.
+//! L2 Get_Info_Req (REQ_ID 0x01): `[object_id][block_index]`.
+//!
+//! | object_id | object                         | notes                       |
+//! |-----------|--------------------------------|-----------------------------|
+//! | 0x00      | X.509 certificate store        | 128 B blocks 0..=29         |
+//! | 0x01      | CHIP_ID (128 B)                |                             |
+//! | 0x02      | RISC-V FW version (4 B)        | bootloader version in       |
+//! |           |                                | Maintenance mode            |
+//! | 0x04      | SPECT FW version (4 B)         |                             |
+//! | 0xB0      | FW bank header                 | Maintenance mode only;      |
+//! |           |                                | block_index selects bank    |
+//!
+//! Anything else, a block index past the certificate store, or FW_BANK in
+//! Application mode is GEN_ERR (as on the bench chip).
+
+use sha2::{Digest, Sha256};
+
+use crate::certs::{CERT_STORE_BLOCKS, CERT_STORE_BLOCK_SIZE};
 use crate::frame::{build_response, status};
 use crate::object_store::Device;
 
-const OBJECT_ID_X509_CERT: u8 = 0x00;
-const OBJECT_ID_CHIP_ID: u8 = 0x01;
-const OBJECT_ID_RISCV_FW: u8 = 0x02;
-const OBJECT_ID_SPECT_FW: u8 = 0x04;
+pub const OBJECT_X509_CERTIFICATE: u8 = 0x00;
+pub const OBJECT_CHIP_ID: u8 = 0x01;
+pub const OBJECT_RISCV_FW_VERSION: u8 = 0x02;
+pub const OBJECT_SPECT_FW_VERSION: u8 = 0x04;
+pub const OBJECT_FW_BANK: u8 = 0xb0;
 
-/// Each GET_INFO chunk is at most 128B (`TR01_L2_CHUNK_MAX_DATA_SIZE` is
-/// 252B for the wire frame, but the cert chunking convention used by the
-/// host is 128B per block_index).
-const CHUNK_SIZE: usize = 128;
+const BANK_FW1: u8 = 0x01;
+const BANK_FW2: u8 = 0x02;
+const BANK_SPECT1: u8 = 0x11;
+const BANK_SPECT2: u8 = 0x12;
 
-/// Fake firmware version emitted as RISCV_FW_VERSION / SPECT_FW_VERSION.
-/// Top bit clear means "APP mode" (per the doc comment in lt_l2_api_structs.h).
-const FAKE_FW_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
-
-pub fn handle(device: &Device, body: &[u8]) -> Vec<u8> {
-    if body.len() != 2 {
-        return build_response(status::GEN_ERR, &[]);
-    }
-    let object_id = body[0];
-    let block_index = body[1] as usize;
-
+pub fn handle(device: &Device, maintenance: bool, object_id: u8, block: u8) -> Vec<u8> {
+    let p = device.personality;
     match object_id {
-        OBJECT_ID_X509_CERT => respond_chunked(&device.cert_store, block_index),
-        OBJECT_ID_CHIP_ID => {
-            // Pad chip_id to a fixed 128B size; the host receives whatever
-            // RSP_LEN says, so emitting just the 12-byte ID is also valid.
-            let mut out = vec![0u8; 128];
-            out[..device.chip_id.len()].copy_from_slice(&device.chip_id);
-            build_response(status::REQUEST_OK, &out)
+        OBJECT_X509_CERTIFICATE => {
+            let block = block as usize;
+            if block >= CERT_STORE_BLOCKS {
+                return build_response(status::GEN_ERR, &[]);
+            }
+            let mut chunk = vec![0u8; CERT_STORE_BLOCK_SIZE];
+            let start = block * CERT_STORE_BLOCK_SIZE;
+            if start < device.cert_store.len() {
+                let end = (start + CERT_STORE_BLOCK_SIZE).min(device.cert_store.len());
+                chunk[..end - start].copy_from_slice(&device.cert_store[start..end]);
+            }
+            build_response(status::REQUEST_OK, &chunk)
         }
-        OBJECT_ID_RISCV_FW | OBJECT_ID_SPECT_FW => {
-            build_response(status::REQUEST_OK, &FAKE_FW_VERSION)
+        OBJECT_CHIP_ID => build_response(status::REQUEST_OK, &device.chip_id),
+        OBJECT_RISCV_FW_VERSION => {
+            let v = if maintenance {
+                p.bootloader_version()
+            } else {
+                p.riscv_fw_version()
+            };
+            build_response(status::REQUEST_OK, &v)
         }
-        _ => build_response(status::UNKNOWN_ERR, &[]),
+        OBJECT_SPECT_FW_VERSION => {
+            let v = if maintenance {
+                p.bootloader_spect_version()
+            } else {
+                p.spect_fw_version()
+            };
+            build_response(status::REQUEST_OK, &v)
+        }
+        OBJECT_FW_BANK if maintenance => match block {
+            BANK_FW1 => build_response(
+                status::REQUEST_OK,
+                &bank_header(device, 1, p.riscv_fw_version(), 0x5ec0),
+            ),
+            BANK_SPECT1 => build_response(
+                status::REQUEST_OK,
+                &bank_header(device, 2, p.spect_fw_version(), 0x2350),
+            ),
+            BANK_FW2 | BANK_SPECT2 => {
+                build_response(status::REQUEST_OK, &vec![0xff; p.fw_bank_header_len()])
+            }
+            _ => build_response(status::REQUEST_OK, &[]),
+        },
+        _ => build_response(status::GEN_ERR, &[]),
     }
 }
 
-fn respond_chunked(blob: &[u8], block_index: usize) -> Vec<u8> {
-    // libtropic's `lt_get_info_cert_store` requires every chunk to be
-    // exactly 128 bytes (it errors out on any other rsp_len). We always
-    // emit a full 128B chunk; if the block is past the end of the blob
-    // we just emit zeros for that range. The host's loop terminates
-    // based on the cert lengths in the header, not the chunk contents.
-    let mut chunk = vec![0u8; CHUNK_SIZE];
-    let start = block_index.saturating_mul(CHUNK_SIZE);
-    if start < blob.len() {
-        let end = (start + CHUNK_SIZE).min(blob.len());
-        chunk[..end - start].copy_from_slice(&blob[start..end]);
+/// Synthesized header of an occupied firmware bank, in the bootloader 1.x
+/// (20 B) or 2.x (52 B) layout. Hash fields are derived from the chip ID so
+/// they are stable per simulated device.
+fn bank_header(device: &Device, fw_type: u8, version: [u8; 4], size: u32) -> Vec<u8> {
+    let digest = Sha256::new()
+        .chain_update(&device.chip_id)
+        .chain_update([fw_type])
+        .finalize();
+    let mut h = Vec::with_capacity(52);
+    if device.personality.fw_bank_header_len() == 20 {
+        h.extend_from_slice(&[fw_type, 0, 0, 0]);
+        h.extend_from_slice(&version);
+        h.extend_from_slice(&size.to_le_bytes());
+        h.extend_from_slice(&digest[..8]);
+    } else {
+        h.extend_from_slice(&(fw_type as u16).to_le_bytes());
+        h.push(0);
+        h.push(2);
+        h.extend_from_slice(&version);
+        h.extend_from_slice(&size.to_le_bytes());
+        h.extend_from_slice(&digest[..4]);
+        h.extend_from_slice(&digest);
+        h.extend_from_slice(&[0, 0, 0, 0]);
     }
-    build_response(status::REQUEST_OK, &chunk)
+    h
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::status;
     use crate::object_store::Store;
 
     #[test]
-    fn chip_id_round_trip() {
+    fn chip_id_is_128_bytes() {
         let store = Store::fresh();
-        let resp = handle(&store.device, &[OBJECT_ID_CHIP_ID, 0]);
-        // [STATUS][RSP_LEN][DATA(128)][CRC(2)]
+        let resp = handle(&store.device, false, OBJECT_CHIP_ID, 0);
         assert_eq!(resp[0], status::REQUEST_OK);
         assert_eq!(resp[1], 128);
-        assert_eq!(&resp[2..2 + 12], &store.device.chip_id);
+        assert_eq!(&resp[2..130], store.device.chip_id.as_slice());
     }
 
     #[test]
-    fn cert_chunk_zero_returns_full_128() {
+    fn cert_blocks_cover_3840_bytes() {
         let store = Store::fresh();
-        let resp = handle(&store.device, &[OBJECT_ID_X509_CERT, 0]);
-        assert_eq!(resp[0], status::REQUEST_OK);
-        // Always exactly 128 bytes, regardless of where the cert ends.
-        assert_eq!(resp[1] as usize, CHUNK_SIZE);
-        // First chunk starts with the cert-store header (version=1, num_certs=4).
+        let resp = handle(&store.device, false, OBJECT_X509_CERTIFICATE, 0);
+        assert_eq!(resp[1] as usize, CERT_STORE_BLOCK_SIZE);
         assert_eq!(resp[2], 1);
         assert_eq!(resp[3], 4);
+        assert_eq!(
+            handle(&store.device, false, OBJECT_X509_CERTIFICATE, 29)[0],
+            status::REQUEST_OK
+        );
+        assert_eq!(
+            handle(&store.device, false, OBJECT_X509_CERTIFICATE, 30)[0],
+            status::GEN_ERR
+        );
     }
 
     #[test]
-    fn cert_chunk_past_end_returns_zeros() {
+    fn fw_bank_only_in_maintenance() {
         let store = Store::fresh();
-        let resp = handle(&store.device, &[OBJECT_ID_X509_CERT, 99]);
-        assert_eq!(resp[0], status::REQUEST_OK);
-        assert_eq!(resp[1] as usize, CHUNK_SIZE);
-        // All zeros past the end -- the host's loop would have stopped
-        // already based on the cert lengths header.
-        assert!(resp[2..2 + CHUNK_SIZE].iter().all(|&b| b == 0));
+        assert_eq!(
+            handle(&store.device, false, OBJECT_FW_BANK, 1)[0],
+            status::GEN_ERR
+        );
+        let r = handle(&store.device, true, OBJECT_FW_BANK, 1);
+        assert_eq!(r[0], status::REQUEST_OK);
+        assert_eq!(r[1], 20);
+        assert_eq!(handle(&store.device, true, OBJECT_FW_BANK, 3)[1], 0);
     }
 
     #[test]
-    fn fw_version_returns_4_bytes() {
+    fn unknown_object_is_gen_err() {
         let store = Store::fresh();
-        let resp = handle(&store.device, &[OBJECT_ID_RISCV_FW, 0]);
-        assert_eq!(resp[0], status::REQUEST_OK);
-        assert_eq!(resp[1], 4);
-    }
-
-    #[test]
-    fn unknown_object_returns_unknown_err() {
-        let store = Store::fresh();
-        let resp = handle(&store.device, &[0xFE, 0]);
-        assert_eq!(resp[0], status::UNKNOWN_ERR);
+        for id in [0x03, 0x05, 0xff] {
+            assert_eq!(handle(&store.device, false, id, 0)[0], status::GEN_ERR);
+        }
     }
 }

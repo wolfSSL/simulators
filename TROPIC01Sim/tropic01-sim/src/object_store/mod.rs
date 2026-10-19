@@ -30,45 +30,113 @@ use rand::rngs::OsRng;
 use rand_core::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Static};
 
-pub use types::{CurveKind, Device, EccSlot, KeyOrigin, PairingSlot, RMemSlot};
+use crate::certs;
+use crate::personality::Personality;
 
-/// Default pairing-key slot used by the wolfSSL port (`PAIRING_KEY_SLOT_INDEX_0`).
-pub const DEFAULT_PAIRING_SLOT: u8 = 0;
+pub use types::{
+    CurveKind, Device, EccSlot, KeyOrigin, PairingSlot, PairingState, CONFIG_REGISTERS,
+    STORE_FORMAT_VERSION,
+};
 
-/// In-memory store with optional JSON-file persistence. Mirrors the
-/// `Store` shape used by the other simulators in this repo.
+/// `lt_sh0priv_eng_sample` from libtropic `src/libtropic_default_sh0_keys.c`.
+pub const LT_SH0PRIV_ENG_SAMPLE: [u8; 32] = [
+    0xd0, 0x99, 0x92, 0xb1, 0xf1, 0x7a, 0xbc, 0x4d, 0xb9, 0x37, 0x17, 0x68, 0xa2, 0x7d, 0xa0, 0x5b,
+    0x18, 0xfa, 0xb8, 0x56, 0x13, 0xa7, 0x84, 0x2c, 0xa6, 0x4c, 0x79, 0x10, 0xf2, 0x2e, 0x71, 0x6b,
+];
+
+/// `lt_sh0pub_eng_sample`: pairing slot 0 of engineering-sample parts.
+pub const LT_SH0PUB_ENG_SAMPLE: [u8; 32] = [
+    0xe7, 0xf7, 0x35, 0xba, 0x19, 0xa3, 0x3f, 0xd6, 0x73, 0x23, 0xab, 0x37, 0x26, 0x2d, 0xe5, 0x36,
+    0x08, 0xca, 0x57, 0x85, 0x76, 0x53, 0x43, 0x52, 0xe1, 0x8f, 0x64, 0xe6, 0x13, 0xd3, 0x8d, 0x54,
+];
+
+/// `lt_sh0priv_prod0`.
+pub const LT_SH0PRIV_PROD0: [u8; 32] = [
+    0x28, 0x3f, 0x5a, 0x0f, 0xfc, 0x41, 0xcf, 0x50, 0x98, 0xa8, 0xe1, 0x7d, 0xb6, 0x37, 0x2c, 0x3c,
+    0xaa, 0xd1, 0xee, 0xee, 0xdf, 0x0f, 0x75, 0xbc, 0x3f, 0xbf, 0xcd, 0x9c, 0xab, 0x3d, 0xe9, 0x72,
+];
+
+/// `lt_sh0pub_prod0`: pairing slot 0 of production parts.
+pub const LT_SH0PUB_PROD0: [u8; 32] = [
+    0xf9, 0x75, 0xeb, 0x3c, 0x2f, 0xd7, 0x90, 0xc9, 0x6f, 0x29, 0x4f, 0x15, 0x57, 0xa5, 0x03, 0x17,
+    0x80, 0xc9, 0xaa, 0xfa, 0x14, 0x0d, 0xa2, 0x8f, 0x55, 0xe7, 0x51, 0x57, 0x37, 0xb2, 0x50, 0x2c,
+];
+
+/// How a fresh device is provisioned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Provisioning {
+    pub personality: Personality,
+    /// Pre-load R-Memory slots 0..=3 with the fixtures wolfSSL's TROPIC01
+    /// port (`wolfcrypt/src/port/tropicsquare/tropic01.c`) reads from its
+    /// hardcoded slot map. A real chip ships with empty R-Memory.
+    pub wolfssl_fixtures: bool,
+}
+
 pub struct Store {
     pub device: Device,
     path: Option<PathBuf>,
 }
 
 impl Store {
-    /// Load from `path` if it exists, otherwise create a freshly provisioned
-    /// store and persist it back to `path`.
-    pub fn load_or_init(path: &Path) -> io::Result<Self> {
+    /// Load the device from `path`, or provision a new one there.
+    pub fn load_or_init(path: &Path, prov: Provisioning) -> io::Result<Self> {
         if path.exists() {
             let bytes = fs::read(path)?;
-            let device: Device = serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let device: Device = serde_json::from_slice(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: {e} (stores from older simulator versions are not \
+                         compatible; set TROPIC01_SIM_FRESH=1 to reprovision)",
+                        path.display()
+                    ),
+                )
+            })?;
+            if device.format_version != STORE_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: store format {} is not {STORE_FORMAT_VERSION}; set \
+                         TROPIC01_SIM_FRESH=1 to reprovision",
+                        path.display(),
+                        device.format_version
+                    ),
+                ));
+            }
             return Ok(Self {
                 device,
                 path: Some(path.to_path_buf()),
             });
         }
         let store = Self {
-            device: fresh_device(),
+            device: provision(prov),
             path: Some(path.to_path_buf()),
         };
         store.persist()?;
         Ok(store)
     }
 
-    /// Build a freshly provisioned store with no on-disk persistence.
+    /// A freshly provisioned device that is never written to disk.
     pub fn fresh() -> Self {
+        Self::fresh_with(Provisioning::default())
+    }
+
+    pub fn fresh_with(prov: Provisioning) -> Self {
         Self {
-            device: fresh_device(),
+            device: provision(prov),
             path: None,
         }
+    }
+
+    /// Provision a new device and persist it to `path`, replacing whatever
+    /// was there.
+    pub fn create(path: &Path, prov: Provisioning) -> io::Result<Self> {
+        let store = Self {
+            device: provision(prov),
+            path: Some(path.to_path_buf()),
+        };
+        store.persist()?;
+        Ok(store)
     }
 
     pub fn persist(&self) -> io::Result<()> {
@@ -81,179 +149,63 @@ impl Store {
     }
 }
 
-/// Build a freshly provisioned TROPIC01 simulator device:
-/// - Random 12-byte chip ID.
-/// - Random X25519 static keypair (STPRIV/STPUB).
-/// - A minimal X.509-shaped certificate carrying STPUB at the X25519
-///   subject-public-key offset libtropic's ASN.1 helper looks for.
-/// - Pairing slot 0 holds the host pairing pubkey from `default_host_pairing_pub()`.
-///   The matching host private key is `default_host_pairing_priv()`. These
-///   are the dev fixtures the wolfSSL test app feeds via `Tropic01_SetPairingKeys`.
-/// - R-memory slots 0..=3 pre-loaded with the AES/Ed25519 fixtures the
-///   wolfSSL crypto callback expects (see tropic01.h:57-76).
-/// - No ECC slots populated; wolfSSL's keygen test populates ECC slot 1
-///   on-the-fly.
-fn fresh_device() -> Device {
-    let mut chip_id = [0u8; 12];
-    OsRng.fill_bytes(&mut chip_id);
+fn random32() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    OsRng.fill_bytes(&mut b);
+    b
+}
 
-    let st_priv_bytes = {
-        let mut b = [0u8; 32];
-        OsRng.fill_bytes(&mut b);
-        b
-    };
-    let st_secret = X25519Static::from(st_priv_bytes);
-    let st_pub_bytes = X25519Public::from(&st_secret).to_bytes();
+fn provision(prov: Provisioning) -> Device {
+    let p = prov.personality;
 
-    let cert_store = build_minimal_cert_store(&st_pub_bytes);
+    let mut serial = [0u8; 8];
+    OsRng.fill_bytes(&mut serial);
+
+    let st_priv = random32();
+    let st_pub = X25519Public::from(&X25519Static::from(st_priv)).to_bytes();
+    let cert_store = certs::build_cert_store(&st_pub, &serial);
 
     let mut pairing_slots = BTreeMap::new();
     pairing_slots.insert(
-        DEFAULT_PAIRING_SLOT,
+        0,
         PairingSlot {
-            public_key: default_host_pairing_pub(),
-            is_valid: true,
+            public_key: p.default_sh0_pub(),
+            state: PairingState::Written,
         },
     );
 
+    let mut r_config = vec![0xffff_ffffu32; CONFIG_REGISTERS];
+    r_config[0] = p.default_r_config_start_up();
+    let i_config = vec![0xffff_ffffu32; CONFIG_REGISTERS];
+
     let mut r_mem_slots = BTreeMap::new();
-    r_mem_slots.insert(0, RMemSlot { data: default_aes_key().to_vec() });
-    r_mem_slots.insert(1, RMemSlot { data: default_aes_iv().to_vec() });
-    r_mem_slots.insert(2, RMemSlot { data: default_ed25519_pub().to_vec() });
-    r_mem_slots.insert(3, RMemSlot { data: default_ed25519_priv().to_vec() });
+    if prov.wolfssl_fixtures {
+        r_mem_slots.insert(0, wolfssl_fixture_aes_key().to_vec());
+        r_mem_slots.insert(1, wolfssl_fixture_aes_iv().to_vec());
+        r_mem_slots.insert(2, wolfssl_fixture_ed25519_pub().to_vec());
+        r_mem_slots.insert(3, wolfssl_fixture_ed25519_priv().to_vec());
+    }
 
     Device {
-        chip_id,
-        st_priv: st_priv_bytes,
-        st_pub: st_pub_bytes,
+        format_version: STORE_FORMAT_VERSION,
+        personality: p,
+        chip_id: p.chip_id(&serial),
+        st_priv,
+        st_pub,
         cert_store,
         pairing_slots,
+        r_config,
+        i_config,
         ecc_slots: BTreeMap::new(),
         r_mem_slots,
+        mcounters: BTreeMap::new(),
+        macandd_slots: BTreeMap::new(),
+        macandd_keys: [random32(), random32()],
     }
 }
 
-/// Sizes of each cert in the cert-store fixture, in order
-/// `[device, xxxx, tropic01, root]`. Each entry must be > 128 bytes so
-/// `lt_get_info_cert_store`'s "at most one trailing chunk" assumption
-/// holds. The device cert is 256B (so the X25519 SPKI fits comfortably
-/// with room for an outer SEQUENCE wrapper); the others are 128B-aligned
-/// padding because nothing inspects them.
-const CERT_LENS: [usize; 4] = [256, 128, 128, 128];
-
-/// Header length: version (1) + num_certs (1) + 4 BE u16 cert lengths (8) = 10 B.
-const CERT_STORE_HEADER_LEN: usize = 10;
-
-/// Total cert-store blob length (header + concatenated certs). Padded up
-/// to the next 128B boundary so chunked reads always return a full
-/// 128-byte chunk -- libtropic's helper checks `rsp_len == 128` per
-/// chunk and would error out on a short final chunk.
-pub fn cert_store_blob_len() -> usize {
-    let total = CERT_STORE_HEADER_LEN + CERT_LENS.iter().sum::<usize>();
-    total.div_ceil(128) * 128
-}
-
-/// Build the 4-cert cert-store blob libtropic reads via
-/// `GET_INFO(X509_CERTIFICATE)`. Layout (matches the parser in
-/// `libtropic/src/libtropic.c::lt_get_info_cert_store`):
-///
-///   [0]      version (1)
-///   [1]      num_certs (4)
-///   [2..10]  4 BE u16 cert lengths
-///   [10..]   <cert0> <cert1> <cert2> <cert3>
-///   <pad to 128B chunk boundary>
-///
-/// Cert 0 is a 256-byte DER blob containing an X25519 SPKI:
-///   30 82 00 FC                          SEQUENCE (long-form, len 252)
-///     30 05 06 03 2B 65 6E               AlgorithmIdentifier (X25519 OID)
-///     03 21 00 <32 STPUB bytes>          BIT STRING (33 B: unused-bits=0 + key)
-///     <padding zero bytes to fill 256B>
-///
-/// libtropic's recursive ASN.1 parser walks the outer SEQUENCE, finds
-/// the X25519 OID (1.3.101.110), captures the next BIT STRING, and
-/// crops the leading "unused-bits" byte to recover the 32-byte STPUB.
-/// Padding is consumed silently: trailing 0x00 bytes parse as
-/// zero-length tags that the parser drops without error.
-fn build_minimal_cert_store(st_pub: &[u8; 32]) -> Vec<u8> {
-    let mut out = vec![0u8; cert_store_blob_len()];
-    out[0] = 1; // version
-    out[1] = 4; // num_certs
-    for (i, &len) in CERT_LENS.iter().enumerate() {
-        let lo = 2 + i * 2;
-        out[lo..lo + 2].copy_from_slice(&(len as u16).to_be_bytes());
-    }
-
-    // Place cert 0 starting at byte 10.
-    let mut p = CERT_STORE_HEADER_LEN;
-    let device_cert = build_device_cert(st_pub, CERT_LENS[0]);
-    out[p..p + device_cert.len()].copy_from_slice(&device_cert);
-    p += CERT_LENS[0];
-
-    // Certs 1..3: 128 bytes each. They're never inspected by libtropic
-    // beyond a memcpy into the host buffer, so any DER-shaped padding
-    // works. We emit a SEQUENCE wrapper of length 125 with zero padding
-    // inside so an offline DER inspector doesn't get confused.
-    for &len in &CERT_LENS[1..] {
-        let inner_len = len - 3;
-        out[p] = 0x30;
-        out[p + 1] = 0x81;
-        out[p + 2] = inner_len as u8;
-        // bytes p+3..p+len already zero
-        p += len;
-    }
-
-    out
-}
-
-fn build_device_cert(st_pub: &[u8; 32], total_len: usize) -> Vec<u8> {
-    // Outer SEQUENCE header: 30 82 <len_hi> <len_lo>  -- 4 bytes.
-    // Inner length = total_len - 4.
-    assert!(total_len >= 4 + 44 && total_len <= 0xFFFF + 4);
-    let inner_len = (total_len - 4) as u16;
-    let mut out = vec![0u8; total_len];
-    out[0] = 0x30;
-    out[1] = 0x82;
-    out[2..4].copy_from_slice(&inner_len.to_be_bytes());
-
-    // Then the SPKI right after the header.
-    let spki = [
-        0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x6E, // AlgorithmIdentifier (X25519)
-        0x03, 0x21, 0x00, // BIT STRING tag, length 33, unused-bits=0
-    ];
-    let spki_start = 4;
-    out[spki_start..spki_start + spki.len()].copy_from_slice(&spki);
-    out[spki_start + spki.len()..spki_start + spki.len() + 32].copy_from_slice(st_pub);
-    // Remainder is zero padding, which the ASN.1 parser absorbs as
-    // sequences of (tag=0x00, length=0).
-    out
-}
-
-/// `sh0priv_eng_sample` from `libtropic/src/libtropic_default_sh0_keys.c`.
-/// libtropic exports this constant as the host pairing private key for
-/// engineering (pre-production) TROPIC01 samples in slot 0; using the same
-/// bytes here means the wolfSSL test app and any libtropic client can
-/// authenticate against the simulator with no extra setup.
-pub const DEFAULT_HOST_PAIRING_PRIV: [u8; 32] = [
-    0xd0, 0x99, 0x92, 0xb1, 0xf1, 0x7a, 0xbc, 0x4d, 0xb9, 0x37, 0x17, 0x68, 0xa2, 0x7d, 0xa0, 0x5b,
-    0x18, 0xfa, 0xb8, 0x56, 0x13, 0xa7, 0x84, 0x2c, 0xa6, 0x4c, 0x79, 0x10, 0xf2, 0x2e, 0x71, 0x6b,
-];
-
-/// `sh0pub_eng_sample` from `libtropic/src/libtropic_default_sh0_keys.c`.
-/// Matches the X25519 public key derived from `DEFAULT_HOST_PAIRING_PRIV`.
-pub const DEFAULT_HOST_PAIRING_PUB: [u8; 32] = [
-    0xe7, 0xf7, 0x35, 0xba, 0x19, 0xa3, 0x3f, 0xd6, 0x73, 0x23, 0xab, 0x37, 0x26, 0x2d, 0xe5, 0x36,
-    0x08, 0xca, 0x57, 0x85, 0x76, 0x53, 0x43, 0x52, 0xe1, 0x8f, 0x64, 0xe6, 0x13, 0xd3, 0x8d, 0x54,
-];
-
-pub fn default_host_pairing_priv() -> [u8; 32] {
-    DEFAULT_HOST_PAIRING_PRIV
-}
-
-pub fn default_host_pairing_pub() -> [u8; 32] {
-    DEFAULT_HOST_PAIRING_PUB
-}
-
-pub fn default_aes_key() -> [u8; 32] {
+/// AES-256 key fixture for wolfSSL's TROPIC01 port (R-Memory slot 0).
+pub fn wolfssl_fixture_aes_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(0x11);
@@ -261,7 +213,8 @@ pub fn default_aes_key() -> [u8; 32] {
     k
 }
 
-pub fn default_aes_iv() -> [u8; 32] {
+/// AES IV fixture (R-Memory slot 1).
+pub fn wolfssl_fixture_aes_iv() -> [u8; 32] {
     let mut iv = [0u8; 32];
     for (i, b) in iv.iter_mut().enumerate() {
         *b = i as u8;
@@ -269,7 +222,8 @@ pub fn default_aes_iv() -> [u8; 32] {
     iv
 }
 
-pub fn default_ed25519_priv() -> [u8; 32] {
+/// Ed25519 private key fixture (R-Memory slot 3).
+pub fn wolfssl_fixture_ed25519_priv() -> [u8; 32] {
     let mut s = [0u8; 32];
     for (i, b) in s.iter_mut().enumerate() {
         *b = 0x40 | (i as u8 & 0x3F);
@@ -277,9 +231,10 @@ pub fn default_ed25519_priv() -> [u8; 32] {
     s
 }
 
-pub fn default_ed25519_pub() -> [u8; 32] {
+/// Ed25519 public key fixture matching the private key (R-Memory slot 2).
+pub fn wolfssl_fixture_ed25519_pub() -> [u8; 32] {
     use ed25519_dalek::SigningKey;
-    SigningKey::from_bytes(&default_ed25519_priv())
+    SigningKey::from_bytes(&wolfssl_fixture_ed25519_priv())
         .verifying_key()
         .to_bytes()
 }
@@ -290,65 +245,59 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn fresh_store_has_chip_identity() {
+    fn fresh_store_matches_a_blank_chip() {
         let store = Store::fresh();
-        assert_ne!(store.device.st_pub, [0u8; 32]);
-        // [version=1][num_certs=4][4x BE u16 cert lengths starting at byte 2]
-        assert_eq!(store.device.cert_store[0], 1);
-        assert_eq!(store.device.cert_store[1], 4);
-        // Device cert begins at byte 10 with `30 82 <len_hi> <len_lo>`
-        // and STPUB lands 14 bytes in (header + SPKI prefix).
-        assert_eq!(store.device.cert_store[10], 0x30);
-        let stpub_offset = 10 + 4 + 10; // header + outer hdr + SPKI prefix
+        let d = &store.device;
+        assert_eq!(d.personality, Personality::Es012);
+        assert_eq!(d.chip_id.len(), 128);
+        assert_ne!(d.st_pub, [0u8; 32]);
+        assert_eq!(d.pairing_slots.len(), 1);
+        assert_eq!(d.pairing_slots[&0].public_key, LT_SH0PUB_ENG_SAMPLE);
+        assert!(d.r_mem_slots.is_empty());
+        assert!(d.ecc_slots.is_empty());
+        assert!(d.mcounters.is_empty());
+        assert_eq!(d.r_config[0], 0xffff_ffef);
+        assert_eq!(d.effective_config()[0x100 / 4], 0xffff_ffff);
+    }
+
+    #[test]
+    fn production_personality_uses_prod0_key() {
+        let store = Store::fresh_with(Provisioning {
+            personality: Personality::Fw220,
+            wolfssl_fixtures: false,
+        });
+        assert_eq!(store.device.pairing_slots[&0].public_key, LT_SH0PUB_PROD0);
+    }
+
+    #[test]
+    fn wolfssl_fixtures_are_opt_in() {
+        let store = Store::fresh_with(Provisioning {
+            personality: Personality::Es012,
+            wolfssl_fixtures: true,
+        });
+        assert_eq!(store.device.r_mem_slots.len(), 4);
         assert_eq!(
-            &store.device.cert_store[stpub_offset..stpub_offset + 32],
-            &store.device.st_pub
+            store.device.r_mem_slots[&0],
+            wolfssl_fixture_aes_key().to_vec()
         );
     }
 
     #[test]
-    fn cert_store_blob_is_chunk_aligned() {
-        let store = Store::fresh();
-        assert_eq!(store.device.cert_store.len() % 128, 0);
-        assert_eq!(store.device.cert_store.len(), 768); // 6 chunks of 128
-    }
-
-    #[test]
-    fn fresh_store_has_default_pairing_slot() {
-        let store = Store::fresh();
-        let slot = store.device.pairing_slots.get(&0).unwrap();
-        assert!(slot.is_valid);
-        assert_eq!(slot.public_key, default_host_pairing_pub());
-    }
-
-    #[test]
-    fn engineering_sample_keys_are_consistent_pair() {
-        // Verify the sh0priv/sh0pub bytes from libtropic actually form a
-        // valid X25519 pair under x25519-dalek's clamping.
-        let secret = X25519Static::from(DEFAULT_HOST_PAIRING_PRIV);
-        let derived = X25519Public::from(&secret).to_bytes();
-        assert_eq!(derived, DEFAULT_HOST_PAIRING_PUB);
-    }
-
-    #[test]
-    fn fresh_store_has_r_mem_fixtures() {
-        let store = Store::fresh();
-        assert_eq!(store.device.r_mem_slots.get(&0).unwrap().data.len(), 32);
-        assert_eq!(store.device.r_mem_slots.get(&3).unwrap().data.len(), 32);
-        assert_eq!(
-            store.device.r_mem_slots.get(&2).unwrap().data,
-            default_ed25519_pub().to_vec()
-        );
-    }
-
-    #[test]
-    fn load_or_init_round_trip() {
+    fn persist_and_reload_round_trip() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("tropic_store.json");
-        let store_a = Store::load_or_init(&path).unwrap();
-        let chip_id = store_a.device.chip_id;
-        drop(store_a);
-        let store_b = Store::load_or_init(&path).unwrap();
-        assert_eq!(store_b.device.chip_id, chip_id);
+        let path = dir.path().join("store.json");
+        let a = Store::load_or_init(&path, Provisioning::default()).unwrap();
+        let b = Store::load_or_init(&path, Provisioning::default()).unwrap();
+        assert_eq!(a.device.st_pub, b.device.st_pub);
+        assert_eq!(a.device.chip_id, b.device.chip_id);
+        assert_eq!(a.device.cert_store, b.device.cert_store);
+    }
+
+    #[test]
+    fn stale_store_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        fs::write(&path, b"{\"chip_id\": []}").unwrap();
+        assert!(Store::load_or_init(&path, Provisioning::default()).is_err());
     }
 }

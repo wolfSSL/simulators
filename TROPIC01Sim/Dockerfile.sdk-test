@@ -24,15 +24,19 @@ FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
     build-essential cmake git ca-certificates pkg-config python3 \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+# libssl-dev: the SDK test uses OpenSSL EVP for Ed25519 verify because
+# the mbedTLS v4 PSA profile libtropic's CAL fetches does not include
+# PSA_ALG_PURE_EDDSA. P-256 verify still goes through PSA.
 
 COPY --from=sim-builder /app/tropic01-sim/target/release/tcp_server /app/tcp_server
 
 # ---- Clone libtropic at a pinned commit ----
-# Pinned to an explicit commit so the simulator's L2/L3 wire-protocol
+# Pinned to the v4.2.0 release commit so the simulator's L2/L3 wire-protocol
 # expectations stay reproducible. Bump deliberately if the upstream
 # protocol changes (CHANGELOG.md tracks renames and structural shifts).
-ARG LIBTROPIC_REF=51044cdc2e0aabff42305130b344c5db3136f158
+ARG LIBTROPIC_REF=9085ea5387a8a1d5a946c7e4f633c7134e4909a7
 RUN git clone https://github.com/tropicsquare/libtropic.git /app/libtropic && \
     git -C /app/libtropic checkout ${LIBTROPIC_REF}
 

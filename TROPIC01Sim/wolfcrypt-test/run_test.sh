@@ -25,6 +25,9 @@ SIM_HOST="${TROPIC01_SIM_HOST:-127.0.0.1}"
 export TROPIC01_SIM_BIND="${TROPIC01_SIM_BIND:-127.0.0.1}"
 export TROPIC01_SIM_PORT="${SIM_PORT}"
 export TROPIC01_SIM_FRESH=1
+# wolfSSL's TROPIC01 port reads its AES key/IV and Ed25519 key pair from
+# R-Memory slots 0..3; a real chip ships empty, so provision them.
+export TROPIC01_SIM_WOLFSSL_FIXTURES=1
 
 cleanup() {
     if [ -n "${SIM_PID:-}" ] && kill -0 "${SIM_PID}" 2>/dev/null; then

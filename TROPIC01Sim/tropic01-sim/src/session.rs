@@ -56,11 +56,11 @@ use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Static};
 
-use crate::object_store::Device;
+use crate::object_store::{Device, PairingState};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const PROTOCOL_NAME: [u8; 32] = *b"Noise_KK1_25519_AESGCM_SHA256\0\0\0";
+pub const PROTOCOL_NAME: [u8; 32] = *b"Noise_KK1_25519_AESGCM_SHA256\0\0\0";
 pub const HANDSHAKE_REQ_LEN: usize = 33; // EHPUB(32) + pkey_index(1)
 pub const HANDSHAKE_RSP_LEN: usize = 48; // ETPUB(32) + tag(16)
 
@@ -70,6 +70,9 @@ pub struct SessionKeys {
     pub k_res: [u8; 32],
     pub nonce_cmd: [u8; 12],
     pub nonce_res: [u8; 12],
+    /// Pairing key slot the session was established with; selects the
+    /// User Access Privilege bits checked for every L3 command.
+    pub pkey_index: u8,
 }
 
 /// Per-connection volatile state.
@@ -141,7 +144,13 @@ impl Session {
         let cipher = Aes256Gcm::new_from_slice(&keys.k_cmd).expect("32-byte key");
         let nonce: &Nonce<aes_gcm::aead::consts::U12> = (&keys.nonce_cmd).into();
         let plaintext = cipher
-            .decrypt(nonce, Payload { msg: ct_and_tag, aad: &[] })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct_and_tag,
+                    aad: &[],
+                },
+            )
             .map_err(|_| L3WrapError::BadTag)?;
         step_nonce(&mut keys.nonce_cmd)?;
         Ok(plaintext)
@@ -154,7 +163,13 @@ impl Session {
         let cipher = Aes256Gcm::new_from_slice(&keys.k_res).expect("32-byte key");
         let nonce: &Nonce<aes_gcm::aead::consts::U12> = (&keys.nonce_res).into();
         let ct_and_tag = cipher
-            .encrypt(nonce, Payload { msg: plaintext, aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &[],
+                },
+            )
             .expect("AES-GCM encrypt cannot fail with valid key/nonce");
         step_nonce(&mut keys.nonce_res)?;
         let res_size = plaintext.len() as u16;
@@ -182,7 +197,7 @@ impl Session {
             .pairing_slots
             .get(&pkey_index)
             .ok_or(HandshakeError::InvalidPairingSlot)?;
-        if !pairing_slot.is_valid {
+        if pairing_slot.state != PairingState::Written {
             return Err(HandshakeError::UnauthorizedPairingSlot);
         }
         let shipub = pairing_slot.public_key;
@@ -240,6 +255,7 @@ impl Session {
             k_res,
             nonce_cmd: [0u8; 12],
             nonce_res: [0u8; 12],
+            pkey_index,
         });
 
         let mut response = Vec::with_capacity(HANDSHAKE_RSP_LEN);
@@ -249,13 +265,13 @@ impl Session {
     }
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize().into()
 }
 
-fn sha256_concat(prev: &[u8; 32], extra: &[u8]) -> [u8; 32] {
+pub fn sha256_concat(prev: &[u8; 32], extra: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(prev);
     h.update(extra);
@@ -266,9 +282,8 @@ fn sha256_concat(prev: &[u8; 32], extra: &[u8]) -> [u8; 32] {
 ///   tmp     = HMAC-SHA256(key=salt, msg=ikm)
 ///   output1 = HMAC-SHA256(key=tmp,  msg=[0x01])
 ///   output2 = HMAC-SHA256(key=tmp,  msg=output1 || [0x02])
-fn lt_hkdf(salt: &[u8], ikm: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+pub fn lt_hkdf(salt: &[u8], ikm: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
     mac.update(ikm);
     let tmp: [u8; 32] = mac.finalize().into_bytes().into();
 
@@ -301,9 +316,7 @@ fn aes_gcm_seal_tag(key: &[u8; 32], iv: &[u8; 12], aad: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::{
-        default_host_pairing_priv, default_host_pairing_pub, Store,
-    };
+    use crate::object_store::{Store, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE};
 
     /// End-to-end check: drive the handshake from the host side using the
     /// engineering-sample SHIPRIV/SHIPUB and verify the chip's auth tag.
@@ -331,8 +344,8 @@ mod tests {
         let etpub: [u8; 32] = rsp[..32].try_into().unwrap();
         let tag: [u8; 16] = rsp[32..48].try_into().unwrap();
 
-        let shipub = default_host_pairing_pub();
-        let shipriv_bytes = default_host_pairing_priv();
+        let shipub = LT_SH0PUB_ENG_SAMPLE;
+        let shipriv_bytes = LT_SH0PRIV_ENG_SAMPLE;
         let shipriv = X25519Static::from(shipriv_bytes);
 
         let h0 = sha256(&PROTOCOL_NAME);

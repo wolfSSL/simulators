@@ -163,6 +163,9 @@ pub struct T1Responder {
     apdu_reassembly: Vec<u8>,
     /// Per-connection SCP03 secure channel state.
     scp03: Scp03State,
+    /// PUT KEY is valid only after selecting the Security Domain, not while
+    /// the IoT applet is selected.
+    selected_ssd: bool,
 }
 
 impl T1Responder {
@@ -175,6 +178,7 @@ impl T1Responder {
             iseq_snd: 0,
             apdu_reassembly: Vec::new(),
             scp03: Scp03State::new(),
+            selected_ssd: false,
         }
     }
 
@@ -218,6 +222,7 @@ impl T1Responder {
                 self.iseq_snd = 0;
                 self.apdu_reassembly.clear();
                 self.scp03.reset();
+                self.selected_ssd = false;
 
                 let ft = FrameType::SFrame {
                     code: T1_S_INTERFACE_SOFT_RESET,
@@ -232,6 +237,7 @@ impl T1Responder {
                 self.iseq_snd = 0;
                 self.apdu_reassembly.clear();
                 self.scp03.reset();
+                self.selected_ssd = false;
 
                 let ft = FrameType::SFrame { code: 0x00, is_response: true };
                 let (header, payload_crc) = build_frame(self.nad_se2hd, ft, &[]);
@@ -293,12 +299,24 @@ impl T1Responder {
             // SELECT terminates any secure channel, then proceeds plain.
             if cla == 0x00 && ins == 0xA4 {
                 self.scp03.reset();
+                self.selected_ssd = ParsedApdu::parse(apdu_bytes)
+                    .map(|a| crate::handlers::session::selects_ssd(&a))
+                    .unwrap_or(false);
             }
 
             // INITIALIZE UPDATE (CLA 0x80 INS 0x50): valid from any state.
             if cla == 0x80 && ins == 0x50 {
                 return match ParsedApdu::parse(apdu_bytes) {
-                    Ok(a) => self.scp03.initialize_update(a.p1, &a.data),
+                    Ok(a) => {
+                        let version = crate::applet::AppletVersion::from_env();
+                        let config = store.platform_scp_config(version);
+                        self.scp03.initialize_update_with_config(
+                            a.p1,
+                            &a.data,
+                            version,
+                            config,
+                        )
+                    }
                     Err(_) => ApduResponse::error(0x6700),
                 };
             }
@@ -329,7 +347,28 @@ impl T1Responder {
                         return ApduResponse::error(sw);
                     }
                 };
-                let resp = dispatch::dispatch(&inner, store, true);
+                let resp = if inner.cla == 0x80 && inner.ins == 0xD8 {
+                    if !self.selected_ssd {
+                        ApduResponse::error(0x6A80)
+                    } else {
+                        let version = crate::applet::AppletVersion::from_env();
+                        let current = store.platform_scp_config(version);
+                        match crate::scp03::keys::put_keys(
+                            &current,
+                            inner.p1,
+                            inner.p2,
+                            &inner.data,
+                        ) {
+                            Ok((updated, check_values)) => {
+                                store.set_platform_scp_config(updated);
+                                ApduResponse::success_with_data(check_values)
+                            }
+                            Err(sw) => ApduResponse::error(sw),
+                        }
+                    }
+                } else {
+                    dispatch::dispatch(&inner, store, true)
+                };
                 return match &mut self.scp03 {
                     Scp03State::Active(sess) => sess.wrap_response(resp),
                     _ => ApduResponse::error(SW_SECURITY_STATUS),

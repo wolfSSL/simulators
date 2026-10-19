@@ -37,7 +37,7 @@
 use crate::apdu::*;
 use crate::object_store::types::SecureObject;
 use crate::object_store::{CryptoObjectState, ObjectStore};
-use crate::tlv::{self, Tlv, TAG_1, TAG_2, TAG_3, TAG_4, TAG_POLICY};
+use crate::tlv::{self, Tlv, TAG_1, TAG_2, TAG_3, TAG_4};
 
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -73,7 +73,7 @@ impl AnyAes {
         }
     }
 
-    fn decrypt_block(&self, block: &mut [u8; 16]) {
+    pub(crate) fn decrypt_block(&self, block: &mut [u8; 16]) {
         let ga = GenericArray::from_mut_slice(block);
         match self {
             AnyAes::A128(c) => c.decrypt_block(ga),
@@ -199,12 +199,24 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
         }
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let object_existed = store.exists(&obj_id);
+    if object_existed
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Check if key data is provided in Tag3
     let key_data = tlv::find_tlv(&tlvs, TAG_3).map(|t| t.value.clone());
 
     // Check if this is key generation (P2=Generate) or has a key size tag
-    if apdu.p2 == P2_GENERATE || key_data.as_ref().map_or(false, |d| d.len() <= 2) {
+    let generated = apdu.p2 == P2_GENERATE
+        || key_data.as_ref().is_some_and(|d| d.len() <= 2);
+    let response = if generated {
         // Key generation: Tag3 contains 2-byte key size
         let key_len = key_data
             .as_ref()
@@ -233,7 +245,15 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
         ApduResponse::success()
     } else {
         ApduResponse::error(SW_WRONG_DATA)
+    };
+    if response.sw == SW_NO_ERROR && !object_existed {
+        store.set_creation_metadata(
+            obj_id,
+            creation_policy,
+            if generated { 0x02 } else { 0x01 },
+        );
     }
+    response
 }
 
 /// Handle WRITE HMAC key command (WriteSymmKey with P1=HMAC).
@@ -257,20 +277,33 @@ pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> Apdu
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
 
-    // A present but malformed (or empty) policy TLV is rejected up front,
-    // like the applet would, rather than being recorded as "no policy" and
-    // surfacing later as a strict-mode read denial.
-    let policy = match tlv::find_tlv(&tlvs, TAG_POLICY) {
-        Some(t) => match crate::policy::ar_header_union(&t.value) {
-            Some(header) => Some(header),
-            None => return ApduResponse::error(SW_WRONG_DATA),
-        },
-        None => None,
+    // An empty policy TLV is not a valid HMAC derive-target policy on the
+    // applet, even though other SDK wrappers use it to mean "not supplied".
+    if tlv::find_tlv(&tlvs, crate::tlv::TAG_POLICY)
+        .is_some_and(|tlv| tlv.value.is_empty())
+    {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let policy = creation_policy
+        .as_deref()
+        .and_then(crate::policy::ar_header_union);
+    let object_existed = store.exists(&obj_id);
+    if object_existed
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     match tlv::find_tlv(&tlvs, TAG_3) {
         Some(t) if !t.value.is_empty() => {
             store.insert(obj_id, SecureObject::HMACKey { key: t.value.clone(), policy });
+            if !object_existed {
+                store.set_creation_metadata(obj_id, creation_policy, 0x01);
+            }
             ApduResponse::success()
         }
         _ => ApduResponse::error(SW_WRONG_DATA),

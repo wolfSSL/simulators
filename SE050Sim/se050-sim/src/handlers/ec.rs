@@ -67,6 +67,16 @@ pub fn handle_write_ec_key(
         }
         _ => return ApduResponse::error(SW_WRONG_DATA),
     };
+    let creation_policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(policy) => policy,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    let object_existed = store.exists(&obj_id);
+    if object_existed
+        && !store.policy_allows(&obj_id, crate::policy::POLICY_OBJ_ALLOW_WRITE)
+    {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Extract curve from Tag2
     let (curve_byte, curve) = match tlv::find_tlv(&tlvs, TAG_2) {
@@ -102,7 +112,8 @@ pub fn handle_write_ec_key(
         .or_else(|| tlv::find_tlv(&tlvs, TAG_2).filter(|t| t.value.len() > 4))
         .map(|t| t.value.clone());
 
-    if apdu.key_type() == P1_KEY_PAIR && private_key_data.is_none() {
+    let generated = apdu.key_type() == P1_KEY_PAIR && private_key_data.is_none();
+    let response = if generated {
         // Generate a new key pair
         match curve {
             ECCurve::NistP192 => generate_p192_keypair(obj_id, store),
@@ -129,7 +140,15 @@ pub fn handle_write_ec_key(
         ApduResponse::success()
     } else {
         ApduResponse::error(SW_WRONG_DATA)
+    };
+    if response.sw == SW_NO_ERROR && !object_existed {
+        store.set_creation_metadata(
+            obj_id,
+            creation_policy,
+            if generated { 0x02 } else { 0x01 },
+        );
     }
+    response
 }
 
 fn generate_p192_keypair(obj_id: [u8; 4], store: &mut ObjectStore) -> ApduResponse {

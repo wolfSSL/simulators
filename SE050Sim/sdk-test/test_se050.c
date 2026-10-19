@@ -1765,6 +1765,75 @@ static void test_object_delete(void)
 }
 
 /* ======================================================================
+ * Test: immutable object policy, attributes, no-write and no-delete
+ * ====================================================================== */
+static void test_object_policy(void)
+{
+    TEST_BEGIN("Object-policy-no-write-no-delete");
+    sss_status_t status;
+    sss_se05x_object_t obj;
+    sss_policy_u common;
+    sss_policy_u file;
+    sss_policy_t policy;
+    uint32_t obj_id = OBJ_ID_BASE + 202;
+    uint8_t data[] = "protected";
+    uint8_t replacement[] = "replaced!";
+    SE05x_Result_t exists = kSE05x_Result_FAILURE;
+#if SSS_HAVE_SE05X_VER_GTE_07_02
+    uint8_t attributes[MAX_POLICY_BUFFER_SIZE + 32] = {0};
+    size_t attributes_len = sizeof(attributes);
+#endif
+
+    memset(&common, 0, sizeof(common));
+    memset(&file, 0, sizeof(file));
+    memset(&policy, 0, sizeof(policy));
+    common.type = KPolicy_Common;
+    common.auth_obj_id = 0;
+    common.policy.common.can_Read = 1;
+    file.type = KPolicy_File;
+    file.auth_obj_id = 0;
+    file.policy.file.can_Read = 1;
+    policy.policies[0] = &common;
+    policy.policies[1] = &file;
+    policy.nPolicies = 2;
+
+    cleanup_object(obj_id);
+    sss_key_object_init(&obj, &g_ks);
+    status = sss_key_object_allocate_handle(&obj, obj_id,
+        kSSS_KeyPart_Default, kSSS_CipherType_Binary, sizeof(data),
+        kKeyObject_Mode_Persistent);
+    ASSERT_OK(status, "policy object allocate");
+
+    status = sss_key_store_set_key(&g_ks, &obj, data, sizeof(data),
+        sizeof(data) * 8, &policy, 0);
+    ASSERT_OK(status, "policy object create");
+
+#if SSS_HAVE_SE05X_VER_GTE_07_02
+    status = (sss_status_t)Se05x_API_ReadObjectAttributes(&g_session->s_ctx,
+        obj_id, attributes, &attributes_len);
+    ASSERT_EQ(status, SM_OK, "ReadObjectAttributes");
+    ASSERT_EQ(attributes[14], 8, "policy entry length");
+    ASSERT_EQ(attributes[19], 0x00, "policy header byte 1");
+    ASSERT_EQ(attributes[20], 0x20, "policy read permission");
+    ASSERT_EQ(attributes[21], 0x00, "policy header byte 3");
+    ASSERT_EQ(attributes[22], 0x00, "policy header byte 4");
+    ASSERT_EQ(attributes[23], kSE05x_Origin_EXTERNAL, "object origin");
+#endif
+
+    status = sss_key_store_set_key(&g_ks, &obj, replacement,
+        sizeof(replacement), sizeof(replacement) * 8, NULL, 0);
+    ASSERT_EQ(status, kStatus_SSS_Fail, "no-write object was overwritten");
+
+    status = sss_key_store_erase_key(&g_ks, &obj);
+    ASSERT_EQ(status, kStatus_SSS_Fail, "no-delete object was erased");
+    Se05x_API_CheckObjectExists(&g_session->s_ctx, obj_id, &exists);
+    ASSERT_EQ(exists, kSE05x_Result_SUCCESS, "protected object disappeared");
+
+    sss_key_object_free(&obj);
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Main
  * ====================================================================== */
 int main(void)
@@ -1845,6 +1914,7 @@ int main(void)
     /* Object management */
     test_object_write_read();
     test_object_delete();
+    test_object_policy();
 
     /* Summary */
     test_summary();

@@ -220,6 +220,7 @@ pub const P2_DELETE_ALL: u8 = 0x2A;
 pub const P2_ID: u8 = 0x36;
 pub const P2_ENCRYPT_ONESHOT: u8 = 0x37;
 pub const P2_DECRYPT_ONESHOT: u8 = 0x38;
+pub const P2_ATTRIBUTES: u8 = 0x3B;
 pub const P2_PARAM: u8 = 0x40;
 pub const P2_ENCRYPT_INIT: u8 = 0x42;
 pub const P2_DECRYPT_INIT: u8 = 0x43;

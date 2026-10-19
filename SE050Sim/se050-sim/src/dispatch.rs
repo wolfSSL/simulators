@@ -85,6 +85,11 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore, scp_active: bool) ->
                 let component = crate::tlv::find_tlv(&tlvs, crate::tlv::TAG_4)
                     .and_then(|t| t.value.first().copied())
                     .unwrap_or(0);
+                if let Some(id) = obj_id {
+                    if !store.policy_allows(&id, crate::policy::POLICY_OBJ_ALLOW_READ) {
+                        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+                    }
+                }
                 match obj_id.and_then(|id| store.get(&id)) {
                     Some(crate::object_store::types::SecureObject::RSAKeyPair { private_key_der, .. }) => {
                         use rsa::pkcs1::DecodeRsaPrivateKey;

@@ -33,6 +33,8 @@
 //!   SE050_SIM_SCP03_KVN                (u8, e.g. 0x0B)
 
 use crate::applet::AppletVersion;
+use crate::handlers::aes::AnyAes;
+use serde::{Deserialize, Serialize};
 
 /// SE05x platform SCP key version number
 /// (ex_sss_auth.h EX_SSS_AUTH_SE05X_KEY_VERSION_NO). Bench-verified: the
@@ -75,13 +77,67 @@ const DEVKIT_DEK: [u8; 16] = [
 ];
 
 /// Static Platform SCP03 keys plus the key version number.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Scp03Config {
     pub kvn: u8,
     pub enc: Vec<u8>,
     pub mac: Vec<u8>,
-    /// DEK is stored for completeness (PUT KEY) but is unused today.
+    /// Static key-encryption key used to unwrap PUT KEY data.
     pub dek: Vec<u8>,
+}
+
+/// Parse and validate the GlobalPlatform PUT KEY payload used to replace the
+/// three Platform SCP03 keys. Each incoming key is AES-ECB wrapped with the
+/// current DEK and followed by its 3-byte check value.
+pub fn put_keys(
+    current: &Scp03Config,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+) -> Result<(Scp03Config, Vec<u8>), u16> {
+    const KEY_BLOCK_LEN: usize = 23;
+    const EXPECTED_LEN: usize = 1 + 3 * KEY_BLOCK_LEN;
+
+    if p1 != current.kvn || p2 != 0x81 {
+        return Err(0x6A86); // incorrect P1/P2
+    }
+    if data.len() != EXPECTED_LEN {
+        return Err(0x6700);
+    }
+    let cipher = AnyAes::new(&current.dek).ok_or(0x6985u16)?;
+    let new_kvn = data[0];
+    let mut keys = Vec::with_capacity(3);
+    let mut response = Vec::with_capacity(10);
+    response.push(new_kvn);
+
+    for index in 0..3 {
+        let block = &data[1 + index * KEY_BLOCK_LEN..1 + (index + 1) * KEY_BLOCK_LEN];
+        if block[0] != 0x88 || block[1] != 0x11 || block[2] != 0x10 || block[19] != 0x03 {
+            return Err(0x6A80);
+        }
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&block[3..19]);
+        cipher.decrypt_block(&mut key);
+
+        let key_cipher = AnyAes::new(&key).ok_or(0x6A80u16)?;
+        let mut check = [1u8; 16];
+        key_cipher.encrypt_block(&mut check);
+        if check[..3] != block[20..23] {
+            return Err(0x6A80);
+        }
+        response.extend_from_slice(&check[..3]);
+        keys.push(key.to_vec());
+    }
+
+    Ok((
+        Scp03Config {
+            kvn: new_kvn,
+            enc: keys.remove(0),
+            mac: keys.remove(0),
+            dek: keys.remove(0),
+        },
+        response,
+    ))
 }
 
 impl Scp03Config {
@@ -131,4 +187,44 @@ fn env_u8(name: &str) -> Option<u8> {
     let raw = raw.trim();
     let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")).unwrap_or(raw);
     u8::from_str_radix(raw, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrap_key(dek: &[u8], key: &[u8; 16]) -> Vec<u8> {
+        let cipher = AnyAes::new(dek).unwrap();
+        let mut encrypted = *key;
+        cipher.encrypt_block(&mut encrypted);
+        let key_cipher = AnyAes::new(key).unwrap();
+        let mut check = [1u8; 16];
+        key_cipher.encrypt_block(&mut check);
+        let mut out = vec![0x88, 0x11, 0x10];
+        out.extend_from_slice(&encrypted);
+        out.push(0x03);
+        out.extend_from_slice(&check[..3]);
+        out
+    }
+
+    #[test]
+    fn put_key_unwraps_all_keys_and_returns_check_values() {
+        let current = Scp03Config::from_env(AppletVersion::V7_2_22F);
+        let enc = [0x11; 16];
+        let mac = [0x22; 16];
+        let dek = [0x33; 16];
+        let mut data = vec![current.kvn];
+        data.extend_from_slice(&wrap_key(&current.dek, &enc));
+        data.extend_from_slice(&wrap_key(&current.dek, &mac));
+        data.extend_from_slice(&wrap_key(&current.dek, &dek));
+
+        let (updated, response) = put_keys(&current, current.kvn, 0x81, &data).unwrap();
+        assert_eq!(updated.enc, enc);
+        assert_eq!(updated.mac, mac);
+        assert_eq!(updated.dek, dek);
+        assert_eq!(response.len(), 10);
+
+        data[20] ^= 1;
+        assert_eq!(put_keys(&current, current.kvn, 0x81, &data), Err(0x6A80));
+    }
 }

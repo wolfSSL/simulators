@@ -21,6 +21,32 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Immutable metadata attached when a secure object is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectMetadata {
+    /// Raw TAG_POLICY value, including one or more length-prefixed access
+    /// rule entries. None means the applet's unrestricted default policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Vec<u8>>,
+    /// SE05x_Origin_t: external/imported=1, internal/generated=2,
+    /// trust-provisioned=3.
+    #[serde(default = "default_object_origin")]
+    pub origin: u8,
+}
+
+impl Default for ObjectMetadata {
+    fn default() -> Self {
+        Self {
+            policy: None,
+            origin: default_object_origin(),
+        }
+    }
+}
+
+fn default_object_origin() -> u8 {
+    0x01
+}
+
 /// Types of EC curves supported by the simulator.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum ECCurve {

@@ -23,7 +23,9 @@ pub mod types;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use types::SecureObject;
+use crate::applet::AppletVersion;
+use crate::scp03::keys::Scp03Config;
+use types::{ObjectMetadata, SecureObject};
 
 /// Hex-encoded 4-byte object ID used as JSON key.
 type ObjectIdKey = String;
@@ -60,6 +62,10 @@ pub enum CryptoObjectState {
 /// Object store backed by an in-memory HashMap with optional JSON file persistence.
 pub struct ObjectStore {
     objects: HashMap<[u8; 4], SecureObject>,
+    /// Creation-time policy and origin. Kept separate from SecureObject so
+    /// policy behavior is uniform across every object type and persistence
+    /// remains backward-compatible with old enum payloads.
+    metadata: HashMap<[u8; 4], ObjectMetadata>,
     persist_path: Option<PathBuf>,
     /// EC curve objects: curve ID -> bitmask of uploaded parameters
     /// (kSE05x_ECCurveParam bits; CURVE_PARAMS_COMPLETE = usable).
@@ -74,6 +80,10 @@ pub struct ObjectStore {
     /// SetPlatformSCPRequest state: when true, plain (non-SCP03) commands are
     /// refused. Persisted, matching the boot-persistent flag on real silicon.
     scp_required: bool,
+    /// Rotated Platform SCP03 keys. None selects the applet-personality
+    /// defaults (or environment overrides). Factory reset deliberately does
+    /// not restore these keys, matching the irrecoverable real-card behavior.
+    platform_scp: Option<Scp03Config>,
 }
 
 fn default_curves() -> HashMap<u8, u8> {
@@ -85,22 +95,26 @@ impl ObjectStore {
     pub fn new() -> Self {
         Self {
             objects: HashMap::new(),
+            metadata: HashMap::new(),
             persist_path: None,
             ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
             scp_required: false,
+            platform_scp: None,
         }
     }
 
     pub fn with_persistence(path: PathBuf) -> Self {
         let mut store = Self {
             objects: HashMap::new(),
+            metadata: HashMap::new(),
             persist_path: Some(path.clone()),
             ec_curves: default_curves(),
             crypto_objects: HashMap::new(),
             crypto_object_types: HashMap::new(),
             scp_required: false,
+            platform_scp: None,
         };
         store.load();
         store
@@ -119,9 +133,39 @@ impl ObjectStore {
         self.objects.get_mut(id)
     }
 
+    /// Record immutable object metadata on first creation. Repeated RSA
+    /// component writes and ordinary overwrites cannot replace the policy.
+    pub fn set_creation_metadata(
+        &mut self,
+        id: [u8; 4],
+        policy: Option<Vec<u8>>,
+        origin: u8,
+    ) {
+        self.metadata
+            .entry(id)
+            .or_insert(ObjectMetadata { policy, origin });
+        self.persist();
+    }
+
+    pub fn metadata(&self, id: &[u8; 4]) -> Option<&ObjectMetadata> {
+        self.metadata.get(id)
+    }
+
+    /// No attached policy means the applet default allows the operation.
+    /// Once a policy is attached, an omitted permission is a denial.
+    pub fn policy_allows(&self, id: &[u8; 4], permission: u32) -> bool {
+        match self.metadata.get(id).and_then(|m| m.policy.as_deref()) {
+            Some(raw) => crate::policy::ar_header_union(raw)
+                .map(|header| header & permission != 0)
+                .unwrap_or(false),
+            None => true,
+        }
+    }
+
     pub fn remove(&mut self, id: &[u8; 4]) -> Option<SecureObject> {
         let result = self.objects.remove(id);
         if result.is_some() {
+            self.metadata.remove(id);
             self.persist();
         }
         result
@@ -141,6 +185,7 @@ impl ObjectStore {
         // curve set afterwards (see ec_curves) so key generation keeps
         // working for hosts that never create curves themselves.
         self.objects.clear();
+        self.metadata.clear();
         self.ec_curves = default_curves();
         self.crypto_objects.clear();
         self.crypto_object_types.clear();
@@ -206,6 +251,17 @@ impl ObjectStore {
         self.persist();
     }
 
+    pub fn platform_scp_config(&self, version: AppletVersion) -> Scp03Config {
+        self.platform_scp
+            .clone()
+            .unwrap_or_else(|| Scp03Config::from_env(version))
+    }
+
+    pub fn set_platform_scp_config(&mut self, config: Scp03Config) {
+        self.platform_scp = Some(config);
+        self.persist();
+    }
+
     fn persist(&self) {
         let Some(path) = &self.persist_path else { return };
         let objects: HashMap<ObjectIdKey, &SecureObject> = self
@@ -218,10 +274,17 @@ impl ObjectStore {
             .iter()
             .map(|(k, v)| (format!("{:02x}", k), *v))
             .collect();
+        let metadata: HashMap<ObjectIdKey, &ObjectMetadata> = self
+            .metadata
+            .iter()
+            .map(|(k, v)| (hex::encode(k), v))
+            .collect();
         let doc = serde_json::json!({
             "objects": objects,
+            "metadata": metadata,
             "ec_curves": curves,
             "scp_required": self.scp_required,
+            "platform_scp": self.platform_scp,
         });
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(path, json);
@@ -243,6 +306,9 @@ impl ObjectStore {
                 .get("scp_required")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            self.platform_scp = value
+                .get("platform_scp")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
             if let Some(curves) = value.get("ec_curves").and_then(|v| v.as_object()) {
                 self.ec_curves = curves
                     .iter()
@@ -252,6 +318,22 @@ impl ObjectStore {
                         Some((id, mask))
                     })
                     .collect();
+            }
+            if let Some(metadata) = value.get("metadata").and_then(|v| v.as_object()) {
+                for (hex_key, metadata_value) in metadata {
+                    let Ok(bytes) = hex::decode(hex_key) else { continue };
+                    if bytes.len() != 4 {
+                        continue;
+                    }
+                    let Ok(metadata) = serde_json::from_value::<ObjectMetadata>(
+                        metadata_value.clone(),
+                    ) else {
+                        continue;
+                    };
+                    let mut id = [0u8; 4];
+                    id.copy_from_slice(&bytes);
+                    self.metadata.insert(id, metadata);
+                }
             }
             value.get("objects").cloned().unwrap_or_default()
         } else {
@@ -333,6 +415,56 @@ mod persistence_tests {
         assert!(store.curve_exists(0x06));
         assert!(!store.curve_ready(0x06));
         assert!(store.curve_ready(0x03));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_policy_metadata_round_trips_and_is_removed_with_object() {
+        let path = unique_store_path("metadata_store_test");
+        let id = [0, 0, 0, 0x43];
+        let policy = vec![
+            0x08, 0, 0, 0, 0, 0x00, 0x20, 0x00, 0x00,
+        ];
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.insert(id, SecureObject::Binary { data: vec![1, 2, 3] });
+            store.set_creation_metadata(id, Some(policy.clone()), 0x02);
+        }
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            let metadata = store.metadata(&id).expect("metadata missing");
+            assert_eq!(metadata.policy.as_deref(), Some(policy.as_slice()));
+            assert_eq!(metadata.origin, 0x02);
+            assert!(store.policy_allows(&id, crate::policy::POLICY_OBJ_ALLOW_READ));
+            assert!(!store.policy_allows(&id, crate::policy::POLICY_OBJ_ALLOW_DELETE));
+            assert!(store.remove(&id).is_some());
+        }
+        let store = ObjectStore::with_persistence(path.clone());
+        assert!(store.metadata(&id).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[test]
+    fn test_platform_scp_keys_round_trip_and_survive_clear() {
+        let path = unique_store_path("scp_keys_store_test");
+        let config = Scp03Config {
+            kvn: 0x0c,
+            enc: vec![0x11; 16],
+            mac: vec![0x22; 16],
+            dek: vec![0x33; 16],
+        };
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.set_platform_scp_config(config.clone());
+            store.clear();
+        }
+        let store = ObjectStore::with_persistence(path.clone());
+        let loaded = store.platform_scp_config(AppletVersion::V7_2_22F);
+        assert_eq!(loaded.kvn, config.kvn);
+        assert_eq!(loaded.enc, config.enc);
+        assert_eq!(loaded.mac, config.mac);
+        assert_eq!(loaded.dek, config.dek);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -128,12 +128,26 @@ impl Scp03State {
     /// the handshake. P1 is the requested key version number. The 8-byte host
     /// challenge is the command data field.
     pub fn initialize_update(&mut self, p1: u8, host_challenge: &[u8]) -> ApduResponse {
+        let version = AppletVersion::from_env();
+        self.initialize_update_with_config(
+            p1,
+            host_challenge,
+            version,
+            Scp03Config::from_env(version),
+        )
+    }
+
+    pub fn initialize_update_with_config(
+        &mut self,
+        p1: u8,
+        host_challenge: &[u8],
+        version: AppletVersion,
+        cfg: Scp03Config,
+    ) -> ApduResponse {
         if host_challenge.len() != 8 {
             *self = Scp03State::Idle;
             return ApduResponse::error(SW_WRONG_LENGTH);
         }
-        let version = AppletVersion::from_env();
-        let cfg = Scp03Config::from_env(version);
         // Applet versions below 4.3 get the older Platform SCP semantics.
         let legacy = matches!(version, AppletVersion::V3_1_1);
 

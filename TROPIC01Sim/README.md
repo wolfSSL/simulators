@@ -8,21 +8,24 @@ application firmware L3 command set. Host code built on libtropic (wolfSSL's
 TROPIC01 port, the wolfHSM TROPIC01 port, applications) can be tested
 without hardware.
 
-The default personality was validated against a real chip: a conformance
-probe that runs unchanged on the chip and on the simulator produces 267
-identical behavioural observations. See
+The `es-0.1.2` and `es-2.2.0` personalities were validated against the same
+real chip, before and after a firmware update: a conformance probe that runs
+unchanged on the chip and on the simulator produces 267 (FW 0.1.2) and 357
+(FW 2.2.0) identical behavioural observations. See
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the bench, the probe,
 the chip behaviours it recorded and what is not verified.
 
 ## Firmware personalities
 
-TROPIC01 behaviour differs between firmware releases. Select one with
+TROPIC01 behaviour depends on the part (silicon, bootloader, factory
+provisioning) and on the firmware it runs. Select a combination with
 `TROPIC01_SIM_PERSONALITY`:
 
-| Personality | Models | Validated |
-| --- | --- | --- |
-| `es-0.1.2` (default) | Engineering sample: application FW 0.1.2, SPECT FW 0.3.1, bootloader 1.0.1, 444-byte R-Memory slots, lenient L3 size checks, debug log enabled, libtropic's `eng_sample` key in pairing slot 0 | Against a real chip |
-| `2.2.0` | Production part: application FW 2.2.0, SPECT FW 1.3.0, bootloader 2.0.1, 475-byte R-Memory slots, strict L3 sizes (L2 `GEN_ERR` and session close), empty log, libtropic's `prod0` key in pairing slot 0 | Against Tropic Square's functional model (ts-tvl) and release notes |
+| Personality | Part | Firmware | Validated |
+| --- | --- | --- | --- |
+| `es-0.1.2` (default) | Engineering sample: bootloader 1.0.1, 20-byte bank headers, debug log enabled, libtropic's `eng_sample` key in pairing slot 0 | Application FW 0.1.2, SPECT FW 0.3.1: 444-byte R-Memory slots, lenient L3 size checks | Against a real chip |
+| `es-2.2.0` | The same engineering sample after a firmware update and the RNGTEST_DIS erratum fix | Application FW 2.2.0, SPECT FW 1.3.0: 475-byte R-Memory slots, strict L3 sizes (L2 `GEN_ERR` and session close) | Against the same chip after the update |
+| `2.2.0` | Production part: bootloader 2.0.1, 52-byte bank headers, empty log, libtropic's `prod0` key in pairing slot 0 | As `es-2.2.0` | Firmware through `es-2.2.0`; the part against Tropic Square's functional model (ts-tvl) and libtropic's model configuration |
 
 ## What is simulated
 
@@ -30,7 +33,8 @@ TROPIC01 behaviour differs between firmware releases. Select one with
 
 - CHIP_STATUS on every transaction (READY, ALARM and START_UP bits), the
   `0xAA` GET_RESPONSE poll and a configurable number of busy polls before
-  a response is ready.
+  a response is ready (READY cleared on FW 0.1.2 and in maintenance mode,
+  READY with no response on FW 2.2.0).
 - Responses are served once and only RESEND repeats them; a replayed frame
   goes in front of the frames not fetched yet. Encrypted L3 results longer
   than one 252-byte L2 chunk are returned as `RESULT_CONT` chunks, and L3
@@ -75,7 +79,10 @@ or a Startup_Req reboot, so configuration writes take effect only then;
 reads return the stored values at once. Result codes
 follow the chip: `UNAUTHORIZED` for out of range targets, `INVALID_KEY` for
 empty ECC slots, `SLOT_NOT_EMPTY`, `SLOT_EMPTY`, `UPDATE_ERR` and so on.
-Unknown command IDs are `INVALID_CMD`.
+Unknown command IDs are `INVALID_CMD`. On FW 2.2.0 a SPECT command (ECC,
+MAC-and-Destroy) rejected for its size leaves the firmware in a state that
+spoils the next command that is not a SPECT command, as the chip does (see
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
 
 ### Device state
 
@@ -90,9 +97,10 @@ change it:
   under the simulator's own root CA (they do not chain to Tropic Square's
   roots);
 - pairing slot 0 with the personality's libtropic key, slots 1 to 3 empty;
-- for `es-0.1.2` the R-Config read from the bench chip (`CFG_START_UP`
-  0xffffffef, the rest erased), for `2.2.0` an erased R-Config; an erased
-  I-Config;
+- for the `es-*` personalities the configuration read from the bench chip
+  (R-Config `CFG_START_UP` 0xffffffef as shipped; 0xffffffeb in R-Config
+  and 0xfffffffb in I-Config after the erratum fix; the rest erased), for
+  `2.2.0` an erased R-Config and I-Config;
 - empty ECC slots, R-Memory, counters and MAC-and-Destroy slots.
 
 With `TROPIC01_SIM_WOLFSSL_FIXTURES=1`, R-Memory slots 0 to 3 are filled
@@ -117,7 +125,7 @@ docker run --rm tropic01-sdk-test
 docker build -f Dockerfile.wolfcrypt -t tropic01-wolfcrypt .
 docker run --rm tropic01-wolfcrypt
 
-# 4. Conformance probe against the simulator, compared with the hardware baseline
+# 4. Conformance probe against the simulator, compared with each hardware baseline
 docker build -f Dockerfile.conformance -t tropic01-conformance .
 docker run --rm tropic01-conformance
 ```
@@ -147,7 +155,7 @@ Environment variables of the TCP server:
 | `TROPIC01_SIM_PORT` | `28992` | Listen port |
 | `TROPIC01_SIM_STORE` | `tropic01_store.json` | Persistent device state |
 | `TROPIC01_SIM_FRESH` | unset | Provision a new device, ignoring the stored one |
-| `TROPIC01_SIM_PERSONALITY` | `es-0.1.2` | Firmware personality (`es-0.1.2`, `2.2.0`); a stored device keeps its personality unless `TROPIC01_SIM_FRESH` is set |
+| `TROPIC01_SIM_PERSONALITY` | `es-0.1.2` | Personality (`es-0.1.2`, `es-2.2.0`, `2.2.0`); a stored device keeps its personality unless `TROPIC01_SIM_FRESH` is set |
 | `TROPIC01_SIM_WOLFSSL_FIXTURES` | unset | Pre-load wolfSSL's R-Memory fixtures at provisioning |
 | `TROPIC01_SIM_BUSY_POLLS` | `1` | GET_RESPONSE polls answered "busy" before each response |
 
@@ -160,7 +168,7 @@ Environment variables of the TCP server:
 | 3 (wolfcrypt) | libtropic | v0.1.0 | wolfSSL's TROPIC01 port uses the v0.x API (`lt_random_get`, `verify_chip_and_start_secure_session`, ...) |
 | 3 | wolfSSL | `master` | Tracks the port; the build fixes a `ForceZero` / `wc_ForceZero` typo in `tropic01.c` |
 | 3 | tropic01-wolfssl-test | `main` | Tropic Square's test app, with its USB dongle HAL swapped for TCP |
-| 4 (conformance) | libtropic | v4.2.0 (`9085ea5`) | The baseline was recorded with it |
+| 4 (conformance) | libtropic | v4.2.0 (`9085ea5`) | The baselines were recorded with it |
 | 4 | wolfSSL | v5.9.4-stable | wolfCrypt CAL and signature checks |
 
 ## Not implemented

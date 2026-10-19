@@ -56,7 +56,7 @@ use crate::frame::{
     MAX_L2_FRAME_SIZE,
 };
 use crate::handlers;
-use crate::handlers::l3::L3Outcome;
+use crate::handlers::l3::{L3Outcome, L3State};
 use crate::object_store::{Device, Store};
 use crate::personality::Personality;
 use crate::session::Session;
@@ -125,6 +125,8 @@ pub struct Chip {
     active_config: Option<Vec<u32>>,
     /// An executed command may have changed the persistent store.
     store_dirty: bool,
+    /// Firmware state left by earlier L3 commands; lost on a reboot.
+    l3_state: L3State,
 }
 
 impl Chip {
@@ -145,6 +147,7 @@ impl Chip {
             l3_expected: 0,
             active_config: None,
             store_dirty: false,
+            l3_state: L3State::default(),
         }
     }
 
@@ -250,10 +253,15 @@ impl Chip {
             if self.mode == Mode::Alarm {
                 self.phase = Phase::NoResponse;
             } else if !self.queue.is_empty() && self.busy_left > 0 {
-                // Busy: READY clear, mode bits kept (0x00 in Application,
-                // 0x04 in Maintenance mode on the bench chip).
+                // Busy. The bootloader and FW 0.1.2 clear READY and keep
+                // the mode bits (0x00 in Application, 0x04 in Maintenance
+                // mode on the bench chip); FW 2.x keeps READY and answers
+                // NO_RESP, like an idle poll.
                 self.busy_left -= 1;
                 self.phase = Phase::NoResponse;
+                if self.mode == Mode::Application && self.personality.busy_poll_ready() {
+                    return cs;
+                }
                 return cs & !chip_status::READY;
             } else if self.queue.is_empty() {
                 self.phase = Phase::NoResponse;
@@ -395,6 +403,7 @@ impl Chip {
         self.mode = mode;
         // The firmware reads the configuration again when it starts
         self.active_config = None;
+        self.l3_state = L3State::default();
     }
 
     fn drop_session(&mut self) {
@@ -472,6 +481,7 @@ impl Chip {
             cfg,
             self.personality,
             pkey_index,
+            &mut self.l3_state,
             &plaintext,
         );
         if plaintext
@@ -516,6 +526,7 @@ fn gen_err() -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::frame::build_request;
+    use crate::object_store::Provisioning;
 
     /// Host side of one L2 exchange: write the request, poll until READY,
     /// read the frame. Returns (chip_status_of_last_poll, frame).
@@ -527,7 +538,10 @@ mod tests {
         read_frame(chip, store)
     }
 
+    /// Polls again on NO_RESP like libtropic does (FW 2.x answers READY
+    /// with NO_RESP while busy) and returns the NO_RESP if nothing comes.
     fn read_frame(chip: &mut Chip, store: &mut Store) -> (u8, Vec<u8>) {
+        let mut none = None;
         for _ in 0..10 {
             chip.csn_low();
             let cs = chip.transfer(store, &[GET_RESPONSE_REQ_ID])[0];
@@ -538,14 +552,15 @@ mod tests {
             let hdr = chip.transfer(store, &[0, 0]);
             if hdr[0] == status::NO_RESP {
                 chip.csn_high();
-                return (cs, hdr);
+                none = Some((cs, hdr));
+                continue;
             }
             let mut frame = hdr.clone();
             frame.extend(chip.transfer(store, &vec![0; hdr[1] as usize + 2]));
             chip.csn_high();
             return (cs, frame);
         }
-        panic!("chip never became ready");
+        none.expect("chip never became ready")
     }
 
     #[test]
@@ -624,6 +639,54 @@ mod tests {
         let mut prod = Chip::new(Personality::Fw220);
         let (_, f) = exchange(&mut prod, &mut store, &build_request(req::HANDSHAKE, &hs));
         assert_eq!(f[0], status::HSK_ERR);
+    }
+
+    #[test]
+    fn busy_poll_follows_firmware() {
+        for (p, busy) in [
+            (Personality::Es012, 0x00),
+            (Personality::Es220, chip_status::READY),
+        ] {
+            let mut store = Store::fresh_with(Provisioning {
+                personality: p,
+                wolfssl_fixtures: false,
+            });
+            let mut chip = Chip::new(p);
+            chip.csn_low();
+            chip.transfer(&mut store, &build_request(req::GET_INFO, &[0x02, 0]));
+            chip.csn_high();
+            chip.csn_low();
+            let miso = chip.transfer(&mut store, &[GET_RESPONSE_REQ_ID, 0, 0]);
+            chip.csn_high();
+            assert_eq!(miso, vec![busy, 0xff, 0xff], "{}", p.name());
+            let (cs, f) = read_frame(&mut chip, &mut store);
+            assert_eq!(cs, chip_status::READY);
+            assert_eq!(&f[2..6], &p.riscv_fw_version());
+        }
+    }
+
+    #[test]
+    fn spect_size_error_survives_sessions_until_reboot() {
+        let mut store = Store::fresh();
+        let mut chip = Chip::new(Personality::Es220);
+        chip.l3_state.spect_size_error = true;
+        let (_, f) = exchange(
+            &mut chip,
+            &mut store,
+            &build_request(req::ENCRYPTED_SESSION_ABT, &[]),
+        );
+        assert_eq!(f[0], status::REQUEST_OK);
+        assert!(chip.l3_state.spect_size_error);
+        let (_, f) = exchange(
+            &mut chip,
+            &mut store,
+            &build_request(req::STARTUP, &[STARTUP_REBOOT]),
+        );
+        assert_eq!(f[0], status::REQUEST_OK);
+        assert!(!chip.l3_state.spect_size_error);
+        chip.l3_state.spect_size_error = true;
+        chip.power_cycle();
+        assert!(!chip.l3_state.spect_size_error);
     }
 
     #[test]

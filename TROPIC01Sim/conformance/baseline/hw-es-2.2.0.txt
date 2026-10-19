@@ -1,0 +1,458 @@
+# TROPIC01 conformance probe output from a real chip: engineering sample,
+# bootloader 1.0.1, updated with libtropic v4.2.0 to application FW 2.2.0,
+# SPECT FW 1.3.0, with the fix for erratum OI_TR01_ERR_2026090100
+# (RNGTEST_DIS cleared in R-Config and I-Config), on a wolfDemo board
+# (STM32U585, SPI). Same chip as hw-es-0.1.2.txt. Device-unique values (chip
+# ID, STPUB, certificate, random data, signatures) are removed. run.sh
+# compares only the "T" lines.
+=== TROPIC01 conformance (hardware) ===
+T 000 lt_init -> LT_OK
+T A01 mode -> LT_OK mode=1
+T A02 get_info chip_id -> cs=01 st=01 len=128 crc=1
+T A03 get_info riscv_fw -> cs=01 st=01 len=4 crc=1
+I A03 riscv_fw=00000202
+T A04 get_info spect_fw -> cs=01 st=01 len=4 crc=1
+I A04 spect_fw=00000301
+T A05 get_info fw_bank(1) app mode -> cs=01 st=7f len=0 crc=-1
+T A06 get_info cert block=0 -> cs=01 st=01 len=128 crc=1
+I A06 cert_hdr=010401a8024502720272
+T A06 get_info cert block=1 -> cs=01 st=01 len=128 crc=1
+T A06 get_info cert block=17 -> cs=01 st=01 len=128 crc=1
+T A06 get_info cert block=18 -> cs=01 st=01 len=128 crc=1
+T A06 get_info cert block=28 -> cs=01 st=01 len=128 crc=1
+T A06 get_info cert block=29 -> cs=01 st=01 len=128 crc=1
+T A06 get_info cert block=30 -> cs=01 st=7f len=0 crc=-1
+T A06 get_info cert block=31 -> cs=01 st=7f len=0 crc=-1
+T A06 get_info cert block=255 -> cs=01 st=7f len=0 crc=-1
+T A07 get_info obj=03 -> cs=01 st=7f len=0 crc=-1
+T A07 get_info obj=05 -> cs=01 st=7f len=0 crc=-1
+T A07 get_info obj=ff -> cs=01 st=7f len=0 crc=-1
+T A08 get_info len=1 -> cs=01 st=7f len=0 crc=-1
+T A08 get_info len=3 -> cs=01 st=7f len=0 crc=-1
+T A08 get_info len=0 -> cs=01 st=7f len=0 crc=-1
+T A09 req_id=77 -> cs=01 st=7e len=0 crc=-1
+T A09 req_id=00 -> cs=01 st=7e len=0 crc=-1
+T A09 req_id=03 -> cs=01 st=7e len=0 crc=-1
+T A09 req_id=b1 (fw update data, app mode) -> cs=01 st=7e len=0 crc=-1
+T A10 get_info bad crc -> cs=01 st=7c len=0 crc=-1
+T A10 resend after crc err -> cs=01 st=7c len=0 crc=-1
+T A11 get_info riscv_fw -> cs=01 st=01 len=4 crc=1
+T A11 resend -> cs=01 st=01 len=4 crc=1
+T A11 resend matches=1
+T A11 resend again -> cs=01 st=01 len=4 crc=1
+T A11 resend2 matches=1
+T A11 resend len=1 -> cs=01 st=7f len=0 crc=-1
+T A12 encrypted_cmd without session -> cs=01 st=7a len=0 crc=-1
+T A13 session_abt without session -> cs=01 st=01 len=0 crc=1
+T A13 session_abt len=1 -> cs=01 st=7f len=0 crc=-1
+T A14 handshake pkey=1 (empty slot) -> cs=01 st=79 len=0 crc=-1
+T A14 handshake pkey=4 (FW 2.x) -> cs=01 st=79 len=0 crc=-1
+T A14 handshake len=32 -> cs=01 st=7f len=0 crc=-1
+T A14 handshake len=34 -> cs=01 st=7f len=0 crc=-1
+T A15 sleep kind=00 -> cs=01 st=7f len=0 crc=-1
+T A15 sleep len=0 -> cs=01 st=7f len=0 crc=-1
+T A15 sleep kind=05 -> cs=01 st=01 len=0 crc=1
+T A15 get_info after sleep -> cs=01 st=01 len=4 crc=1
+T A15 get_info after sleep #2 -> cs=01 st=01 len=4 crc=1
+T A16 get_log -> cs=01 st=01 len=252 crc=1
+T A17 startup id=02 -> cs=01 st=7f len=0 crc=-1
+T A17 startup id=00 -> cs=01 st=7f len=0 crc=-1
+T A17 startup len=0 -> cs=01 st=7f len=0 crc=-1
+T A18 traced get_info riscv_fw -> cs=01 st=01 len=4 crc=1
+I A18 trace: [ {01/01 02/ff 02/ff 00/ff 2b/ff 98/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/01 ff/04} {ff/00 ff/00 ff/02 0a/02 23/ec 20/75} ]
+I A18 idle poll trace: [ {aa/01} {01/ff 04/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ] [ {aa/01} {ff/ff ff/ff} ]
+T A18 idle poll -> LT_L1_CHIP_BUSY
+T B01 cert_store -> LT_OK
+I B01 cert lens 424 581 626 626
+T B02 get_st_pub -> LT_OK
+T B03 session slot0 eng -> LT_OK
+T B03 ping -> LT_OK match=1
+T B04 session again while open -> LT_OK
+T B04 ping -> LT_OK
+T B05 session slot0 wrong shipriv -> LT_CRYPTO_ERR
+T B05 ping after failed handshake -> LT_HOST_NO_SESSION
+T B06 session slot1 (empty) -> LT_L2_HSK_ERR
+T B07 session slot0 eng -> LT_OK
+T B07 session abort -> LT_OK
+T B07 ping after abort -> LT_HOST_NO_SESSION
+T B07 encrypted_cmd after abort -> cs=01 st=7a len=0 crc=-1
+T B08 session -> LT_OK
+T B08 encrypted_cmd bad tag -> cs=01 st=01 len=0 crc=1
+T B08 ping after bad tag -> LT_L2_NO_SESSION
+T B09 session -> LT_OK
+T B09 encrypted_cmd partial chunk -> cs=01 st=03 len=0 crc=-1
+T B09 session_abt -> cs=01 st=01 len=0 crc=1
+T B09 session after partial -> LT_OK
+T B09 ping -> LT_OK
+T B10 sleep -> cs=01 st=01 len=0 crc=1
+T B10 ping after sleep -> LT_L2_NO_SESSION
+T B10 session after sleep -> LT_OK
+T C01 ping len=1 -> LT_OK match=1
+T C01 ping len=2 -> LT_OK match=1
+T C01 ping len=100 -> LT_OK match=1
+T C01 ping len=235 -> LT_OK match=1
+T C01 ping len=236 -> LT_OK match=1
+T C01 ping len=237 -> LT_OK match=1
+T C01 ping len=488 -> LT_OK match=1
+T C01 ping len=1000 -> LT_OK match=1
+T C01 ping len=4096 -> LT_OK match=1
+T C01 ping len=0 -> result=c3 res_size=1
+T C02 cmd_id=00 -> result=02 res_size=1
+T C02 cmd_id=02 -> result=02 res_size=1
+T C02 cmd_id=13 -> result=02 res_size=1
+T C02 cmd_id=23 -> result=02 res_size=1
+T C02 cmd_id=32 -> result=02 res_size=1
+T C02 cmd_id=43 -> result=02 res_size=1
+T C02 cmd_id=51 -> result=02 res_size=1
+T C02 cmd_id=64 -> result=02 res_size=1
+T C02 cmd_id=72 -> result=02 res_size=1
+T C02 cmd_id=83 -> result=02 res_size=1
+T C02 cmd_id=91 -> result=02 res_size=1
+T C02 cmd_id=a0 -> result=02 res_size=1
+T C02 cmd_id=a1 -> result=02 res_size=1
+T C02 cmd_id=a2 -> result=02 res_size=1
+T C02 cmd_id=a3 -> result=02 res_size=1
+T C02 cmd_id=a4 -> result=02 res_size=1
+T C02 cmd_id=a5 -> result=02 res_size=1
+T C02 cmd_id=b0 -> result=02 res_size=1
+T C02 cmd_id=ff -> result=02 res_size=1
+T C03 random 32 -> LT_OK
+T C03 random 255 -> LT_OK
+T C03 random n=0 -> result=c3 res_size=4
+T C03 random n=1 -> result=c3 res_size=5
+T C03 random n=255 -> result=c3 res_size=259
+T C03 random cmd_size=3 -> recv LT_L2_GEN_ERR
+I C03 ping before re-handshake -> LT_L2_NO_SESSION
+T C03 re-handshake -> LT_OK
+T C03 random cmd_size=1 -> recv LT_L2_GEN_ERR
+I C03 ping before re-handshake -> LT_L2_NO_SESSION
+T C03 re-handshake -> LT_OK
+T C04 pairing_key_read 0 -> LT_OK
+T C04 pairing_key 0 is eng sample=1
+T C04 pairing_key_read 1 -> LT_L3_SLOT_EMPTY
+T C04 pairing_key_read 2 -> LT_L3_SLOT_EMPTY
+T C04 pairing_key_read 3 -> LT_L3_SLOT_EMPTY
+T C04 pairing_key_read raw slot=1 -> result=15 res_size=1
+T C04 pairing_key_read raw slot=4 -> result=01 res_size=1
+T C04 pairing_key_read raw slot=256 -> result=01 res_size=1
+T C04 pairing_key_invalidate slot=4 -> result=01 res_size=1
+T C05 r_config read all -> LT_OK
+I C05 R TR01_CFG_START_UP                        ffffffeb
+I C05 R TR01_CFG_SENSORS                         ffffffff
+I C05 R TR01_CFG_DEBUG                           ffffffff
+I C05 R TR01_CFG_GPO_ADDR                        ffffffff
+I C05 R TR01_CFG_SLEEP_MODE                      ffffffff
+I C05 R TR01_CFG_UAP_PAIRING_KEY_WRITE           ffffffff
+I C05 R TR01_CFG_UAP_PAIRING_KEY_READ            ffffffff
+I C05 R TR01_CFG_UAP_PAIRING_KEY_INVALIDATE      ffffffff
+I C05 R TR01_CFG_UAP_R_CONFIG_WRITE_ERASE        ffffffff
+I C05 R TR01_CFG_UAP_R_CONFIG_READ               ffffffff
+I C05 R TR01_CFG_UAP_I_CONFIG_WRITE              ffffffff
+I C05 R TR01_CFG_UAP_I_CONFIG_READ               ffffffff
+I C05 R TR01_CFG_UAP_PING                        ffffffff
+I C05 R TR01_CFG_UAP_R_MEM_DATA_WRITE            ffffffff
+I C05 R TR01_CFG_UAP_R_MEM_DATA_READ             ffffffff
+I C05 R TR01_CFG_UAP_R_MEM_DATA_ERASE            ffffffff
+I C05 R TR01_CFG_UAP_RANDOM_VALUE_GET            ffffffff
+I C05 R TR01_CFG_UAP_ECC_KEY_GENERATE            ffffffff
+I C05 R TR01_CFG_UAP_ECC_KEY_STORE               ffffffff
+I C05 R TR01_CFG_UAP_ECC_KEY_READ                ffffffff
+I C05 R TR01_CFG_UAP_ECC_KEY_ERASE               ffffffff
+I C05 R TR01_CFG_UAP_ECDSA_SIGN                  ffffffff
+I C05 R TR01_CFG_UAP_EDDSA_SIGN                  ffffffff
+I C05 R TR01_CFG_UAP_MCOUNTER_INIT               ffffffff
+I C05 R TR01_CFG_UAP_MCOUNTER_GET                ffffffff
+I C05 R TR01_CFG_UAP_MCOUNTER_UPDATE             ffffffff
+I C05 R TR01_CFG_UAP_MAC_AND_DESTROY             ffffffff
+T C05 i_config read all -> LT_OK
+I C05 I TR01_CFG_START_UP                        fffffffb
+I C05 I TR01_CFG_SENSORS                         ffffffff
+I C05 I TR01_CFG_DEBUG                           ffffffff
+I C05 I TR01_CFG_GPO_ADDR                        ffffffff
+I C05 I TR01_CFG_SLEEP_MODE                      ffffffff
+I C05 I TR01_CFG_UAP_PAIRING_KEY_WRITE           ffffffff
+I C05 I TR01_CFG_UAP_PAIRING_KEY_READ            ffffffff
+I C05 I TR01_CFG_UAP_PAIRING_KEY_INVALIDATE      ffffffff
+I C05 I TR01_CFG_UAP_R_CONFIG_WRITE_ERASE        ffffffff
+I C05 I TR01_CFG_UAP_R_CONFIG_READ               ffffffff
+I C05 I TR01_CFG_UAP_I_CONFIG_WRITE              ffffffff
+I C05 I TR01_CFG_UAP_I_CONFIG_READ               ffffffff
+I C05 I TR01_CFG_UAP_PING                        ffffffff
+I C05 I TR01_CFG_UAP_R_MEM_DATA_WRITE            ffffffff
+I C05 I TR01_CFG_UAP_R_MEM_DATA_READ             ffffffff
+I C05 I TR01_CFG_UAP_R_MEM_DATA_ERASE            ffffffff
+I C05 I TR01_CFG_UAP_RANDOM_VALUE_GET            ffffffff
+I C05 I TR01_CFG_UAP_ECC_KEY_GENERATE            ffffffff
+I C05 I TR01_CFG_UAP_ECC_KEY_STORE               ffffffff
+I C05 I TR01_CFG_UAP_ECC_KEY_READ                ffffffff
+I C05 I TR01_CFG_UAP_ECC_KEY_ERASE               ffffffff
+I C05 I TR01_CFG_UAP_ECDSA_SIGN                  ffffffff
+I C05 I TR01_CFG_UAP_EDDSA_SIGN                  ffffffff
+I C05 I TR01_CFG_UAP_MCOUNTER_INIT               ffffffff
+I C05 I TR01_CFG_UAP_MCOUNTER_GET                ffffffff
+I C05 I TR01_CFG_UAP_MCOUNTER_UPDATE             ffffffff
+I C05 I TR01_CFG_UAP_MAC_AND_DESTROY             ffffffff
+T C05 r_config_read raw addr=0002 -> result=3c res_size=1
+T C05 i_config_read raw addr=0002 -> result=3c res_size=1
+T C05 r_config_read raw addr=00fc -> result=c3 res_size=8
+T C05 i_config_read raw addr=00fc -> result=c3 res_size=8
+T C05 r_config_read raw addr=0200 -> result=01 res_size=1
+T C05 i_config_read raw addr=0200 -> result=01 res_size=1
+T C05 r_config_read raw addr=0204 -> result=01 res_size=1
+T C05 i_config_read raw addr=0204 -> result=01 res_size=1
+T C05 r_config_read raw addr=ffff -> result=01 res_size=1
+T C05 i_config_read raw addr=ffff -> result=01 res_size=1
+T C06 read empty -> LT_L3_INVALID_KEY
+T C06 read empty raw -> result=12 res_size=1
+T C06 erase empty -> LT_OK
+T C06 ecdsa empty -> LT_L3_INVALID_KEY
+T C06 eddsa empty -> LT_L3_INVALID_KEY
+T C06 gen p256 -> LT_OK
+T C06 read p256 -> LT_OK curve=1 origin=1 oncurve=1
+T C06 read p256 raw -> result=c3 res_size=80
+T C06 gen p256 occupied -> LT_L3_FAIL
+T C06 gen ed25519 occupied -> LT_L3_FAIL
+T C06 store occupied -> LT_L3_FAIL
+T C06 ecdsa -> LT_OK verify=1
+T C06 ecdsa again -> LT_OK verify=1 same_sig=0
+T C06 eddsa on p256 -> LT_L3_INVALID_KEY
+T C06 erase -> LT_OK
+T C06 read after erase -> LT_L3_INVALID_KEY
+T C06 gen ed25519 -> LT_OK
+T C06 read ed25519 -> LT_OK curve=2 origin=1
+T C06 read ed25519 raw -> result=c3 res_size=48
+T C06 eddsa len=1 -> LT_OK verify=1
+T C06 eddsa len=64 -> LT_OK verify=1
+T C06 eddsa len=200 -> LT_OK verify=1
+T C06 eddsa len=4000 -> LT_OK verify=1
+T C06 eddsa len=4096 -> LT_OK verify=1
+T C06 eddsa deterministic=0
+T C06 eddsa raw len=0 -> result=c3 res_size=80
+T C06 eddsa len=0 verify=1
+T C06 ecdsa on ed25519 -> LT_L3_INVALID_KEY
+T C06 erase -> LT_OK
+T C06 store ed25519 rfc8032 -> LT_OK
+T C06 read stored ed25519 -> LT_OK curve=2 origin=2 pubmatch=1
+T C06 eddsa raw len=0 (rfc8032 tv1) -> result=c3 res_size=80
+T C06 eddsa tv1 sig matches rfc8032=0
+T C06 store ed25519 occupied -> LT_L3_FAIL
+T C06 erase -> LT_OK
+T C06 store p256 rfc6979 -> LT_OK
+T C06 read stored p256 -> LT_OK curve=1 origin=2 pubmatch=1
+T C06 ecdsa stored -> LT_OK verify=1
+T C06 erase -> LT_OK
+T C06 store p256 k=0 -> LT_L3_FAIL
+T C06 store p256 k=n -> LT_L3_FAIL
+T C06 store p256 k=ff..ff -> LT_L3_FAIL
+T C06 store ed25519 k=0 -> LT_OK
+T C06 gen curve=0 -> result=3c res_size=1
+T C06 gen curve=3 -> result=3c res_size=1
+T C06 gen slot=32 -> result=01 res_size=1
+T C06 read slot=32 -> result=01 res_size=1
+T C06 erase slot=32 -> result=01 res_size=1
+T C06 ecdsa slot=32 -> result=01 res_size=1
+T C06 eddsa slot=32 -> result=01 res_size=1
+T C06 store curve=3 -> result=3c res_size=1
+T C06 read slot=0x11f -> result=01 res_size=1
+T C06 gen cmd_size=5 -> recv LT_L2_GEN_ERR
+I C06 ping before re-handshake -> LT_L2_NO_SESSION
+T C06 re-handshake -> LT_OK
+T C06 ecdsa cmd_size=47 -> recv LT_L2_GEN_ERR
+I C06 ping before re-handshake -> LT_L2_NO_SESSION
+T C06 re-handshake -> LT_OK
+T C06 ecdsa cmd_size=49 -> recv LT_L2_GEN_ERR
+I C06 ping before re-handshake -> LT_L2_NO_SESSION
+T C06 re-handshake -> LT_OK
+T C06 eddsa cmd_size=15 -> recv LT_L2_GEN_ERR
+I C06 ping before re-handshake -> LT_L2_NO_SESSION
+T C06 re-handshake -> LT_OK
+T C07 read empty -> LT_L3_R_MEM_DATA_READ_SLOT_EMPTY len=0
+T C07 read empty raw -> result=c3 res_size=4
+T C07 erase empty -> LT_OK
+T C07 write 1 -> LT_OK
+T C07 read 1 -> LT_OK len=1 match=1
+T C07 read 1 raw -> result=c3 res_size=5
+T C07 write occupied -> LT_L3_SLOT_NOT_EMPTY
+T C07 erase -> LT_OK
+T C07 read after erase -> LT_L3_R_MEM_DATA_READ_SLOT_EMPTY len=0
+T C07 write 444 -> LT_OK
+T C07 read 444 -> LT_OK len=444 match=1
+T C07 write raw 445 -> result=c3 res_size=1
+T C07 write raw 475 -> result=c3 res_size=1
+T C07 read after raw 475 -> result=c3 res_size=479
+T C07 write raw 476 -> recv LT_L2_GEN_ERR
+I C07 ping before re-handshake -> LT_L2_NO_SESSION
+T C07 re-handshake -> LT_OK
+T C07 write raw 0 -> recv LT_L2_GEN_ERR
+I C07 ping before re-handshake -> LT_L2_NO_SESSION
+T C07 re-handshake -> LT_OK
+T C07 read slot=512 -> result=01 res_size=1
+T C07 erase slot=512 -> result=01 res_size=1
+T C07 write slot=512 -> result=01 res_size=1
+T C07 read cmd_size=4 -> recv LT_L2_GEN_ERR
+I C07 ping before re-handshake -> LT_L2_NO_SESSION
+T C07 re-handshake -> LT_OK
+T C07 write 509 -> LT_OK
+T C07 read 510 -> LT_L3_R_MEM_DATA_READ_SLOT_EMPTY len=0
+T C08 init 3 -> LT_OK
+T C08 get -> LT_OK v=3
+T C08 update -> LT_OK
+T C08 get -> LT_OK v=2
+T C08 update -> LT_OK
+T C08 get -> LT_OK v=1
+T C08 update -> LT_OK
+T C08 get -> LT_OK v=0
+T C08 update -> LT_L3_UPDATE_ERR
+T C08 get -> LT_OK v=0
+T C08 update -> LT_L3_UPDATE_ERR
+T C08 init 0 -> LT_OK
+T C08 get -> LT_OK v=0
+T C08 update at 0 -> LT_L3_UPDATE_ERR
+T C08 init fffffffe -> LT_OK
+T C08 get -> LT_OK v=fffffffe
+T C08 update -> LT_OK
+T C08 get -> LT_OK v=fffffffd
+T C08 init ffffffff raw -> result=3c res_size=1
+T C08 get after ffffffff raw -> result=c3 res_size=8
+T C08 update after ffffffff raw -> result=c3 res_size=1
+T C08 get index=16 -> result=01 res_size=1
+T C08 update index=16 -> result=01 res_size=1
+T C08 init index=16 -> result=01 res_size=1
+T C08 get index=15 raw -> result=c3 res_size=8
+I C08 get raw=c3000000fcffffff
+T C08 re-init 10 -> LT_OK
+T C08 get -> LT_OK v=10
+T C09 m&d A -> LT_OK
+T C09 m&d A -> LT_OK
+T C09 m&d A -> LT_OK
+T C09 AA==AAA 1, A!=AA 1
+T C09 out(A,B) history independent=1
+T C09 slot dependent=1
+T C09 order dependent=1
+T C09 m&d slot=128 -> result=01 res_size=1
+T C09 m&d cmd_size=35 -> recv LT_L2_GEN_ERR
+I C09 ping before re-handshake -> LT_L2_NO_SESSION
+T C09 re-handshake -> LT_OK
+T C09 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C09 ping before re-handshake -> LT_L2_NO_SESSION
+T C09 re-handshake -> LT_OK
+T C10 reboot -> LT_OK
+T C10 session -> LT_OK
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=00 res_size=5
+T C10 ping #1 echoed=0
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 ecc_gen cmd_size=5 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=00 res_size=5
+T C10 ping #1 echoed=0
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 ecc_read cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=00 res_size=5
+T C10 ping #1 echoed=0
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 ecdsa cmd_size=47 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=00 res_size=5
+T C10 ping #1 echoed=0
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 eddsa cmd_size=15 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=00 res_size=5
+T C10 ping #1 echoed=0
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 random cmd_size=3 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=c3 res_size=5
+T C10 ping #1 echoed=1
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 rmem_read cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=c3 res_size=5
+T C10 ping #1 echoed=1
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 mcounter_get cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ping #1 -> result=c3 res_size=5
+T C10 ping #1 echoed=1
+T C10 ping #2 -> result=c3 res_size=5
+T C10 ping #2 echoed=1
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 rmem write slot=511 -> result=00 res_size=1
+T C10 rmem read slot=511 -> result=c3 res_size=4
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 ecc_erase slot=31 -> result=c3 res_size=1
+T C10 ping after ecc_erase -> result=c3 res_size=5
+T C10 ping after ecc_erase echoed=1
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 unknown cmd 0xf0 -> result=02 res_size=1
+T C10 ping after unknown cmd -> result=c3 res_size=5
+T C10 ping after unknown cmd echoed=1
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 session abort -> LT_OK
+T C10 session -> LT_OK
+T C10 ping after new session -> result=00 res_size=5
+T C10 ping after new session echoed=0
+T C10 m&d cmd_size=4 -> recv LT_L2_GEN_ERR
+I C10 ping before re-handshake -> LT_L2_NO_SESSION
+T C10 re-handshake -> LT_OK
+T C10 reboot -> LT_OK
+T C10 session -> LT_OK
+T C10 ping after reboot -> result=c3 res_size=5
+T C10 ping after reboot echoed=1
+T D01 reboot -> LT_OK
+T D01 mode -> LT_OK mode=1
+T D01 ping with stale session -> LT_L2_NO_SESSION
+T D02 maintenance reboot -> LT_OK
+T D02 mode -> LT_OK mode=0
+T D02 get_info riscv_fw (bootloader) -> cs=05 st=01 len=4 crc=1
+I D02 trace: [ {01/05 02/ff 02/ff 00/ff 2b/ff 98/ff} ] [ {aa/04} ] [ {aa/05} {ff/01 ff/04} {ff/00 ff/01 ff/00 ff/81 ff/f1 ff/fa} ]
+I D02 bootloader=00010081
+T D02 get_info spect_fw -> cs=05 st=01 len=4 crc=1
+I D02 spect=00000080
+T D02 get_info chip_id -> cs=05 st=01 len=128 crc=1
+T D02 get_info cert block 0 -> cs=05 st=01 len=128 crc=1
+T D02 get_info fw_bank 01 -> cs=05 st=01 len=20 crc=1
+I D02 bank hdr=0100000000000202745300002d0062a4db1fdedf
+T D02 get_info fw_bank 02 -> cs=05 st=01 len=20 crc=1
+I D02 bank hdr=0100000000000202745300002d0062a4db1fdedf
+T D02 get_info fw_bank 11 -> cs=05 st=01 len=20 crc=1
+I D02 bank hdr=020000000000030120290000c92a534f30345af0
+T D02 get_info fw_bank 12 -> cs=05 st=01 len=20 crc=1
+I D02 bank hdr=020000000000030120290000c92a534f30345af0
+T D02 get_info fw_bank 03 -> cs=05 st=01 len=0 crc=1
+T D02 cert_store -> LT_L1_CHIP_STARTUP_MODE
+T D02 session in maintenance -> LT_L2_UNKNOWN_REQ
+T D02 encrypted_cmd -> cs=05 st=7e len=0 crc=-1
+T D02 sleep -> cs=05 st=7e len=0 crc=-1
+T D02 get_log -> cs=05 st=01 len=252 crc=1
+T D03 reboot -> LT_OK
+T D03 mode -> LT_OK mode=1
+T D03 session -> LT_OK
+T D03 ping -> LT_OK
+CONFORMANCE DONE

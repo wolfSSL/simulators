@@ -26,5 +26,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Compare with the hardware baseline
+      - name: Compare with the hardware baselines
         run: docker run --rm tropic01-conformance:ci

@@ -84,20 +84,23 @@ pub fn handle(device: &Device, maintenance: bool, object_id: u8, block: u8) -> V
             };
             build_response(status::REQUEST_OK, &v)
         }
-        OBJECT_FW_BANK if maintenance => match block {
-            BANK_FW1 => build_response(
-                status::REQUEST_OK,
-                &bank_header(device, 1, p.riscv_fw_version(), 0x5ec0),
-            ),
-            BANK_SPECT1 => build_response(
-                status::REQUEST_OK,
-                &bank_header(device, 2, p.spect_fw_version(), 0x2350),
-            ),
-            BANK_FW2 | BANK_SPECT2 => {
-                build_response(status::REQUEST_OK, &vec![0xff; p.fw_bank_header_len()])
+        OBJECT_FW_BANK if maintenance => {
+            let (fw_size, spect_size) = p.fw_image_sizes();
+            match block {
+                BANK_FW2 | BANK_SPECT2 if !p.fw_bank2_written() => {
+                    build_response(status::REQUEST_OK, &vec![0xff; p.fw_bank_header_len()])
+                }
+                BANK_FW1 | BANK_FW2 => build_response(
+                    status::REQUEST_OK,
+                    &bank_header(device, 1, p.riscv_fw_version(), fw_size),
+                ),
+                BANK_SPECT1 | BANK_SPECT2 => build_response(
+                    status::REQUEST_OK,
+                    &bank_header(device, 2, p.spect_fw_version(), spect_size),
+                ),
+                _ => build_response(status::REQUEST_OK, &[]),
             }
-            _ => build_response(status::REQUEST_OK, &[]),
-        },
+        }
         _ => build_response(status::GEN_ERR, &[]),
     }
 }

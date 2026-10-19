@@ -32,7 +32,9 @@
 //!   passed in by the caller), bit `pkey_index` of the 8-bit field covering
 //!   the target;
 //! * an L3 size that does not fit the command is handled per firmware
-//!   personality (lenient on FW 0.1.2, L2 GEN_ERR + session close on 2.x).
+//!   personality (lenient on FW 0.1.2, L2 GEN_ERR + session close on 2.x);
+//! * on FW 2.x a SPECT command rejected for its size leaves state behind
+//!   that spoils the next command (see [`L3State`]).
 
 use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
 use ed25519_dalek::SigningKey as Ed25519Signing;
@@ -139,6 +141,26 @@ pub enum L3Outcome {
     GenErr,
 }
 
+/// Volatile firmware state that outlives one L3 command. Kept across
+/// sessions, lost on a reboot or power cycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct L3State {
+    /// FW 2.x rejected a SPECT command (ECC key and signing commands,
+    /// MAC_And_Destroy) for its size. Until the next well-formed command,
+    /// which clears it, the firmware is left in a state where:
+    ///
+    /// * a SPECT command executes normally;
+    /// * any other command is not executed and answers result 0x00 with
+    ///   zeroed fields: Ping keeps its length, the other commands return
+    ///   the result byte alone (Random_Value_Get returns a length that
+    ///   changes from run to run on the chip; the simulator uses one byte);
+    /// * an unknown command ID answers INVALID_CMD as usual.
+    ///
+    /// libtropic reports the 0x00 result as `LT_L3_RESULT_UNKNOWN`. Observed
+    /// on the bench chip with FW 2.2.0, see `HARDWARE_VALIDATION.md`.
+    pub spect_size_error: bool,
+}
+
 /// How FW 0.1.2 reacts to an L3 command whose size does not fit its ID.
 enum Lenient {
     /// RESULT_FAIL.
@@ -217,6 +239,21 @@ fn es_lenient(id: u8, len: usize) -> Lenient {
     }
 }
 
+/// Commands the firmware hands to the SPECT coprocessor.
+fn is_spect(id: u8) -> bool {
+    use cmd_id::*;
+    matches!(
+        id,
+        ECC_KEY_GENERATE
+            | ECC_KEY_STORE
+            | ECC_KEY_READ
+            | ECC_KEY_ERASE
+            | ECDSA_SIGN
+            | EDDSA_SIGN
+            | MAC_AND_DESTROY
+    )
+}
+
 /// Whether command `id` can change the persistent device state.
 pub fn mutates_store(id: u8) -> bool {
     use cmd_id::*;
@@ -239,12 +276,14 @@ pub fn mutates_store(id: u8) -> bool {
 }
 
 /// Execute one L3 command. `cfg` is the effective configuration in force,
-/// which gates every command by its User Access Privileges.
+/// which gates every command by its User Access Privileges; `state` is the
+/// firmware state left by earlier commands.
 pub fn dispatch(
     dev: &mut Device,
     cfg: &[u32],
     p: Personality,
     pkey: u8,
+    state: &mut L3State,
     plaintext: &[u8],
 ) -> L3Outcome {
     let Some(&id) = plaintext.first() else {
@@ -277,6 +316,7 @@ pub fn dispatch(
             | cmd_id::MAC_AND_DESTROY
     );
     if !known {
+        state.spect_size_error = false;
         return L3Outcome::Result(code(result::INVALID_CMD));
     }
 
@@ -285,6 +325,9 @@ pub fn dispatch(
 
     if !size_ok(p, id, c.len()) {
         if p.strict_l3_sizes() {
+            if is_spect(id) {
+                state.spect_size_error = true;
+            }
             return L3Outcome::GenErr;
         }
         match es_lenient(id, c.len()) {
@@ -292,6 +335,11 @@ pub fn dispatch(
             Lenient::OkNoData => return L3Outcome::Result(code(result::OK)),
             Lenient::Execute => {}
         }
+    }
+
+    if std::mem::take(&mut state.spect_size_error) && !is_spect(id) {
+        let len = if id == cmd_id::PING { c.len() } else { 1 };
+        return L3Outcome::Result(vec![0u8; len]);
     }
 
     L3Outcome::Result(match id {
@@ -849,7 +897,7 @@ mod tests {
     /// force is the one stored.
     fn run(dev: &mut Device, p: Personality, cmd: &[u8]) -> Vec<u8> {
         let cfg = dev.effective_config();
-        match dispatch(dev, &cfg, p, 0, cmd) {
+        match dispatch(dev, &cfg, p, 0, &mut L3State::default(), cmd) {
             L3Outcome::Result(r) => r,
             L3Outcome::GenErr => vec![],
         }
@@ -857,6 +905,16 @@ mod tests {
 
     fn es(dev: &mut Device, cmd: &[u8]) -> Vec<u8> {
         run(dev, Personality::Es012, cmd)
+    }
+
+    /// Like `run`, keeping the firmware state between commands. None is an
+    /// L2 GEN_ERR.
+    fn run_st(dev: &mut Device, p: Personality, st: &mut L3State, cmd: &[u8]) -> Option<Vec<u8>> {
+        let cfg = dev.effective_config();
+        match dispatch(dev, &cfg, p, 0, st, cmd) {
+            L3Outcome::Result(r) => Some(r),
+            L3Outcome::GenErr => None,
+        }
     }
 
     #[test]
@@ -994,9 +1052,81 @@ mod tests {
         // 2.x: L2 GEN_ERR.
         let cfg = d.effective_config();
         assert_eq!(
-            dispatch(d, &cfg, Personality::Fw220, 0, &[0x50, 4, 0]),
+            dispatch(
+                d,
+                &cfg,
+                Personality::Fw220,
+                0,
+                &mut L3State::default(),
+                &[0x50, 4, 0]
+            ),
             L3Outcome::GenErr
         );
+    }
+
+    /// Bench chip, FW 2.2.0: see `L3State::spect_size_error`.
+    #[test]
+    fn spect_size_error_spoils_the_next_command() {
+        let mut s = Store::fresh();
+        let d = &mut s.device;
+        let p = Personality::Es220;
+        let mut st = L3State::default();
+        let ping = [0x01, 0x11, 0x22, 0x33, 0x44];
+        let pong = vec![result::OK, 0x11, 0x22, 0x33, 0x44];
+        let md_short = [0x90, 127, 0, 0];
+        let spect_bad: [&[u8]; 5] = [
+            &md_short,
+            &[0x60, 31, 0, 1, 0],
+            &[0x62, 31, 0, 0],
+            &[0x70; 47],
+            &[0x71; 15],
+        ];
+        for bad in spect_bad {
+            assert_eq!(run_st(d, p, &mut st, bad), None);
+            assert_eq!(run_st(d, p, &mut st, &ping), Some(vec![0; 5]));
+            assert_eq!(run_st(d, p, &mut st, &ping), Some(pong.clone()));
+        }
+        // Commands the CPU handles do not leave it behind.
+        let cpu_bad: [&[u8]; 4] = [
+            &[0x50, 4, 0],
+            &[0x41, 0xff, 0x01, 0],
+            &[0x82, 15, 0, 0],
+            &[0x11, 0, 0, 0],
+        ];
+        for bad in cpu_bad {
+            assert_eq!(run_st(d, p, &mut st, bad), None);
+            assert_eq!(run_st(d, p, &mut st, &ping), Some(pong.clone()));
+        }
+        // The spoiled command is not executed.
+        run_st(d, p, &mut st, &md_short);
+        assert_eq!(
+            run_st(d, p, &mut st, &[0x40, 0xff, 0x01, 0, b'a']),
+            Some(vec![0])
+        );
+        assert_eq!(
+            run_st(d, p, &mut st, &[0x41, 0xff, 0x01]),
+            Some(vec![result::OK, 0, 0, 0])
+        );
+        // A SPECT command executes and clears it, and so does an unknown ID.
+        run_st(d, p, &mut st, &md_short);
+        assert_eq!(
+            run_st(d, p, &mut st, &[0x63, 31, 0]),
+            Some(vec![result::OK])
+        );
+        assert_eq!(run_st(d, p, &mut st, &ping), Some(pong.clone()));
+        run_st(d, p, &mut st, &md_short);
+        assert_eq!(
+            run_st(d, p, &mut st, &[0xf0]),
+            Some(vec![result::INVALID_CMD])
+        );
+        assert_eq!(run_st(d, p, &mut st, &ping), Some(pong.clone()));
+        // FW 0.1.2 accepts the short command, so it never gets there.
+        let mut st = L3State::default();
+        assert_eq!(
+            run_st(d, Personality::Es012, &mut st, &md_short),
+            Some(vec![result::OK])
+        );
+        assert!(!st.spect_size_error);
     }
 
     #[test]
@@ -1011,7 +1141,14 @@ mod tests {
         );
         let cfg = d.effective_config();
         assert_eq!(
-            dispatch(d, &cfg, Personality::Es012, 1, &[0x01, 9]),
+            dispatch(
+                d,
+                &cfg,
+                Personality::Es012,
+                1,
+                &mut L3State::default(),
+                &[0x01, 9]
+            ),
             L3Outcome::Result(vec![result::OK, 9])
         );
     }

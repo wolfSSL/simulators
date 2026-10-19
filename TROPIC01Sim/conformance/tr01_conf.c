@@ -30,6 +30,10 @@
  *
  * Diff the "T" lines of the two logs to find emulator fidelity issues.
  *
+ * A few checks only run on application FW 2.x (strict L3 sizes): FW 0.1.2
+ * handles them differently or goes into ALARM mode, and the FW 0.1.2
+ * baseline was recorded before they were added.
+ *
  * Only reversible operations are performed. ECC slots 29..31, R-mem slots
  * 509..511, mcounter 15 and MAC-and-Destroy slots 126..127 are used as
  * scratch space and left erased (ECC, R-mem) or re-initialized afterwards.
@@ -145,6 +149,7 @@ static void trace_stop(const char* tag)
 
 static lt_handle_t        g_h;
 static int                g_alarm;
+static uint8_t            g_fw_major;
 static uint8_t            g_stpub[32];
 static int                g_fail_local;
 
@@ -165,7 +170,8 @@ static const char* rs(lt_ret_t r)
 
 /* Raw L2 request. Builds [REQ_ID][LEN][DATA][CRC], optionally corrupting the
  * CRC, writes it and reads one response frame. Prints the CHIP_STATUS, the
- * L2 STATUS, RSP_LEN and whether the response CRC is valid. */
+ * L2 STATUS, RSP_LEN and whether the response CRC is valid (nothing when id
+ * is NULL). */
 static lt_ret_t l2_raw(const char* id, const char* desc, uint8_t req_id,
                        const uint8_t* data, uint8_t len, int badcrc,
                        uint8_t* rsp, uint8_t* rsp_len)
@@ -188,12 +194,16 @@ static lt_ret_t l2_raw(const char* id, const char* desc, uint8_t req_id,
     }
     ret = lt_l1_write(&g_h.l2, (uint16_t)(len + 4), LT_L1_SPI_TIMEOUT_MS);
     if (ret != LT_OK) {
-        printf("T %s %s -> write %s\n", id, desc, rs(ret));
+        if (id != NULL) {
+            printf("T %s %s -> write %s\n", id, desc, rs(ret));
+        }
         return ret;
     }
     ret = lt_l1_read(&g_h.l2, TR01_L1_LEN_MAX, LT_L1_SPI_TIMEOUT_MS);
     if (ret != LT_OK) {
-        printf("T %s %s -> read %s cs=%02x\n", id, desc, rs(ret), b[0]);
+        if (id != NULL) {
+            printf("T %s %s -> read %s cs=%02x\n", id, desc, rs(ret), b[0]);
+        }
         if (ret == LT_L1_CHIP_ALARM_MODE) {
             g_alarm = 1;
         }
@@ -202,8 +212,10 @@ static lt_ret_t l2_raw(const char* id, const char* desc, uint8_t req_id,
     crcok = (b[1] == TR01_L2_STATUS_REQUEST_OK || b[1] == TR01_L2_STATUS_RESULT_OK)
                 ? (lt_l2_frame_check(b) == LT_OK)
                 : -1;
-    printf("T %s %s -> cs=%02x st=%02x len=%u crc=%d\n", id, desc, b[0], b[1],
-           b[2], crcok);
+    if (id != NULL) {
+        printf("T %s %s -> cs=%02x st=%02x len=%u crc=%d\n", id, desc, b[0],
+               b[1], b[2], crcok);
+    }
     if (rsp != NULL && rsp_len != NULL) {
         *rsp_len = b[2];
         memcpy(rsp, b + 3, b[2]);
@@ -261,9 +273,11 @@ static void ensure_session(const char* id)
     lt_ret_t ret;
     if (g_h.l3.session_status == LT_SECURE_SESSION_ON) {
         uint8_t p[4] = {1, 2, 3, 4}, q[4];
-        if (lt_ping(&g_h, p, q, 4) == LT_OK) {
+        ret = lt_ping(&g_h, p, q, 4);
+        if (ret == LT_OK) {
             return;
         }
+        printf("I %s ping before re-handshake -> %s\n", id, rs(ret));
     }
     ret = start_session();
     printf("T %s re-handshake -> %s\n", id, rs(ret));
@@ -291,6 +305,7 @@ static void section_a(void)
     d[0] = 0x02;
     l2_raw("A03", "get_info riscv_fw", 0x01, d, 2, 0, rsp, &rlen);
     hexline("I A03 riscv_fw=", rsp, rlen);
+    g_fw_major = (rlen == 4) ? rsp[3] : 0;
     d[0] = 0x04;
     l2_raw("A04", "get_info spect_fw", 0x01, d, 2, 0, rsp, &rlen);
     hexline("I A04 spect_fw=", rsp, rlen);
@@ -341,6 +356,8 @@ static void section_a(void)
         l2_raw("A11", "resend len=1", 0x10, d, 1, 0, NULL, NULL);
     }
 
+    /* A previous host program may have left a session open on the chip */
+    l2_raw(NULL, "prime: session_abt", 0x08, d, 0, 0, NULL, NULL);
     memset(rsp, 0x11, 64);
     rsp[0] = 0x01; rsp[1] = 0x00; /* cmd_size = 1 */
     l2_raw("A12", "encrypted_cmd without session", 0x04, rsp, 19, 0, NULL, NULL);
@@ -350,6 +367,12 @@ static void section_a(void)
     memset(rsp, 0x42, 64);
     rsp[32] = 1;
     l2_raw("A14", "handshake pkey=1 (empty slot)", 0x02, rsp, 33, 0, NULL, NULL);
+    if (g_fw_major >= 2) {
+        /* FW 0.1.2 goes into ALARM mode instead, see CONF_ALARM_TEST */
+        rsp[32] = 4;
+        l2_raw("A14", "handshake pkey=4 (FW 2.x)", 0x02, rsp, 33, 0, NULL,
+               NULL);
+    }
     rsp[32] = 0;
     l2_raw("A14", "handshake len=32", 0x02, rsp, 32, 0, NULL, NULL);
     l2_raw("A14", "handshake len=34", 0x02, rsp, 34, 0, NULL, NULL);
@@ -1047,6 +1070,9 @@ static void c_macandd(void)
     memset(b, 0xb2, sizeof(b));
     memset(c, 0xc3, sizeof(c));
 
+    /* Slot state persists across runs: start from a known one */
+    (void)lt_mac_and_destroy(&g_h, S, c, o4);
+
     ret = lt_mac_and_destroy(&g_h, S, a, o1);
     printf("T C09 m&d A -> %s\n", rs(ret));
     ret = lt_mac_and_destroy(&g_h, S, a, o2);
@@ -1083,6 +1109,105 @@ static void c_macandd(void)
     }
 }
 
+/* FW 2.x: a SPECT command (ECC, MAC_And_Destroy) rejected for its size
+ * spoils the next command that is not a SPECT command, in later sessions
+ * too, until a reboot. */
+static uint8_t g_c10_res[TR01_L3_RES_CIPHERTEXT_MAX_SIZE];
+
+static void c10_ping(const char* desc)
+{
+    static const uint8_t ping[] = {0x01, 0x11, 0x22, 0x33, 0x44};
+    uint16_t res_len = 0;
+
+    (void)l3_raw("C10", desc, ping, sizeof(ping), g_c10_res, &res_len);
+    printf("T C10 %s echoed=%d\n", desc,
+           res_len == sizeof(ping) &&
+               memcmp(g_c10_res + 1, ping + 1, 4) == 0);
+}
+
+static void c10_reboot(void)
+{
+    lt_ret_t ret = lt_reboot(&g_h, TR01_REBOOT);
+    printf("T C10 reboot -> %s\n", rs(ret));
+    ret = start_session();
+    printf("T C10 session -> %s\n", rs(ret));
+}
+
+/* Send a command of the wrong size; reopen the session it closes */
+static void c10_bad(const char* desc, uint8_t id, uint8_t a, uint16_t len)
+{
+    uint8_t  cmd[64];
+    uint16_t res_len;
+
+    memset(cmd, 0, sizeof(cmd));
+    cmd[0] = id;
+    cmd[1] = a;
+    if (l3_raw("C10", desc, cmd, len, g_c10_res, &res_len) != LT_OK) {
+        ensure_session("C10");
+    }
+}
+
+static void c_spect_size_error(void)
+{
+    static const struct {
+        const char* desc;
+        uint8_t     id;
+        uint8_t     a;
+        uint16_t    len;
+    } bad[] = {
+        {"m&d cmd_size=4", 0x90, 127, 4},
+        {"ecc_gen cmd_size=5", 0x60, 31, 5},
+        {"ecc_read cmd_size=4", 0x62, 31, 4},
+        {"ecdsa cmd_size=47", 0x70, 31, 47},
+        {"eddsa cmd_size=15", 0x71, 31, 15},
+        {"random cmd_size=3", 0x50, 4, 3},
+        {"rmem_read cmd_size=4", 0x41, 0xff, 4},
+        {"mcounter_get cmd_size=4", 0x82, 15, 4},
+    };
+    uint8_t  cmd[16];
+    uint16_t res_len;
+    lt_ret_t ret;
+    int      i;
+
+    c10_reboot();
+    for (i = 0; i < (int)(sizeof(bad) / sizeof(bad[0])); i++) {
+        c10_bad(bad[i].desc, bad[i].id, bad[i].a, bad[i].len);
+        c10_ping("ping #1");
+        c10_ping("ping #2");
+    }
+
+    /* The spoiled command is not executed */
+    c10_bad("m&d cmd_size=4", 0x90, 127, 4);
+    memset(cmd, 0, sizeof(cmd));
+    cmd[0] = 0x40; cmd[1] = 0xff; cmd[2] = 0x01; cmd[4] = 0x5a;
+    (void)l3_raw("C10", "rmem write slot=511", cmd, 5, g_c10_res, &res_len);
+    cmd[0] = 0x41;
+    (void)l3_raw("C10", "rmem read slot=511", cmd, 3, g_c10_res, &res_len);
+
+    /* A SPECT command runs and clears it; so does an unknown command */
+    c10_bad("m&d cmd_size=4", 0x90, 127, 4);
+    cmd[0] = 0x63; cmd[1] = 31; cmd[2] = 0;
+    (void)l3_raw("C10", "ecc_erase slot=31", cmd, 3, g_c10_res, &res_len);
+    c10_ping("ping after ecc_erase");
+    c10_bad("m&d cmd_size=4", 0x90, 127, 4);
+    cmd[0] = 0xf0;
+    (void)l3_raw("C10", "unknown cmd 0xf0", cmd, 1, g_c10_res, &res_len);
+    c10_ping("ping after unknown cmd");
+
+    /* It outlives a session that sends no command; a reboot clears it */
+    c10_bad("m&d cmd_size=4", 0x90, 127, 4);
+    ret = lt_session_abort(&g_h);
+    printf("T C10 session abort -> %s\n", rs(ret));
+    ret = start_session();
+    printf("T C10 session -> %s\n", rs(ret));
+    c10_ping("ping after new session");
+    c10_bad("m&d cmd_size=4", 0x90, 127, 4);
+    c10_reboot();
+    c10_ping("ping after reboot");
+
+    (void)lt_r_mem_data_erase(&g_h, 511);
+}
+
 static void section_c(void)
 {
     ensure_session("C00");
@@ -1103,6 +1228,9 @@ static void section_c(void)
     c_mcounter();
     ensure_session("C08");
     c_macandd();
+    if (g_fw_major >= 2) {
+        c_spect_size_error();
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1187,7 +1315,8 @@ static void section_d(void)
 }
 
 #ifdef CONF_ALARM_TEST
-/* Requests observed to put the FW 0.1.2 engineering sample into ALARM mode.
+/* Requests observed to put the FW 0.1.2 engineering sample into ALARM mode
+ * (FW 2.2.0 answers HSK_ERR, checked in A14).
  * Only built with -DCONF_ALARM_TEST; recovering needs a full power cycle. */
 static void section_z(void)
 {

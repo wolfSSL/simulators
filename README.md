@@ -31,8 +31,9 @@ secure element. It speaks libtropic's "TROPIC01 model" protocol over TCP
 runs the Noise_KK1_25519_AESGCM_SHA256 secure channel and implements the full
 L3 command set: RNG, P-256 and Ed25519 keys and signatures, R-Memory,
 monotonic counters, MAC-and-Destroy, pairing keys and configuration. Its
-default firmware personality was validated against a real chip with a
-conformance probe that also runs in CI.
+engineering-sample personalities (application firmware 0.1.2 and 2.2.0)
+were validated against a real chip with a conformance probe that also runs
+in CI.
 
 ## STM32Sim
 

@@ -176,7 +176,8 @@ fn provision(prov: Provisioning) -> Device {
 
     let mut r_config = vec![0xffff_ffffu32; CONFIG_REGISTERS];
     r_config[0] = p.default_r_config_start_up();
-    let i_config = vec![0xffff_ffffu32; CONFIG_REGISTERS];
+    let mut i_config = vec![0xffff_ffffu32; CONFIG_REGISTERS];
+    i_config[0] = p.default_i_config_start_up();
 
     let mut r_mem_slots = BTreeMap::new();
     if prov.wolfssl_fixtures {
@@ -267,6 +268,18 @@ mod tests {
             wolfssl_fixtures: false,
         });
         assert_eq!(store.device.pairing_slots[&0].public_key, LT_SH0PUB_PROD0);
+    }
+
+    #[test]
+    fn updated_es_part_has_the_erratum_fix() {
+        let store = Store::fresh_with(Provisioning {
+            personality: Personality::Es220,
+            wolfssl_fixtures: false,
+        });
+        let d = &store.device;
+        assert_eq!(d.pairing_slots[&0].public_key, LT_SH0PUB_ENG_SAMPLE);
+        assert_eq!(d.r_config[0], 0xffff_ffeb);
+        assert_eq!(d.i_config[0], 0xffff_fffb);
     }
 
     #[test]

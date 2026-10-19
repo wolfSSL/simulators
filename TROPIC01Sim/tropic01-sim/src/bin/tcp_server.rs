@@ -81,7 +81,7 @@ fn main() -> io::Result<()> {
         Ok(name) => Personality::from_name(&name).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unknown TROPIC01_SIM_PERSONALITY {name:?} (es-0.1.2, 2.2.0)"),
+                format!("unknown TROPIC01_SIM_PERSONALITY {name:?} (es-0.1.2, es-2.2.0, 2.2.0)"),
             )
         })?,
         Err(_) => Personality::default(),

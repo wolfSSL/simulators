@@ -31,9 +31,13 @@ TROPIC01 behaviour differs between firmware releases. Select one with
 - CHIP_STATUS on every transaction (READY, ALARM and START_UP bits), the
   `0xAA` GET_RESPONSE poll and a configurable number of busy polls before
   a response is ready.
-- Responses are served once and only RESEND repeats them. Encrypted L3
-  results longer than one 252-byte L2 chunk are returned as `RESULT_CONT`
-  chunks, and L3 commands are reassembled from `REQUEST_CONT` chunks.
+- Responses are served once and only RESEND repeats them; a replayed frame
+  goes in front of the frames not fetched yet. Encrypted L3 results longer
+  than one 252-byte L2 chunk are returned as `RESULT_CONT` chunks, and L3
+  commands are reassembled from `REQUEST_CONT` chunks.
+- All TCP connections talk to the same chip. A new connection is a new
+  host on a chip that stays powered: its mode, ALARM state and secure
+  session carry over.
 - TCP `POWER_ON`, `POWER_OFF` and `RESET_TARGET` power cycle the chip: the
   session, queued responses and ALARM mode are lost, persistent state is
   kept.
@@ -65,7 +69,10 @@ TROPIC01 behaviour differs between firmware releases. Select one with
 | `0x90` | MAC_AND_DESTROY (128 slots, KMAC256 construction) |
 
 Every command is gated by its User Access Privilege configuration (the
-R-Config AND I-Config value, one bit per pairing slot), and result codes
+R-Config AND I-Config value, one bit per pairing slot). As in Tropic
+Square's model, the firmware reads that configuration after a power cycle
+or a Startup_Req reboot, so configuration writes take effect only then;
+reads return the stored values at once. Result codes
 follow the chip: `UNAUTHORIZED` for out of range targets, `INVALID_KEY` for
 empty ECC slots, `SLOT_NOT_EMPTY`, `SLOT_EMPTY`, `UPDATE_ERR` and so on.
 Unknown command IDs are `INVALID_CMD`.
@@ -73,7 +80,8 @@ Unknown command IDs are `INVALID_CMD`.
 ### Device state
 
 Each simulated device is provisioned on first start (or with
-`TROPIC01_SIM_FRESH=1`) and saved as JSON after every SPI transfer:
+`TROPIC01_SIM_FRESH=1`) and saved as JSON after every command that can
+change it:
 
 - a CHIP_ID with the personality's layout and a random serial number;
 - a static X25519 key pair (STPRIV/STPUB) and a four-certificate store with

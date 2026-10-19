@@ -257,7 +257,7 @@ mod tests {
         assert!(d.ecc_slots.is_empty());
         assert!(d.mcounters.is_empty());
         assert_eq!(d.r_config[0], 0xffff_ffef);
-        assert_eq!(d.config(0x100), 0xffff_ffff);
+        assert_eq!(d.effective_config()[0x100 / 4], 0xffff_ffff);
     }
 
     #[test]

@@ -34,13 +34,20 @@
 //!   by the next queued L2 response frame, or READY followed by 0xFF
 //!   (STATUS=NO_RESP) when nothing is queued. A frame is consumed once it
 //!   has been clocked out completely; it then becomes the frame that a
-//!   Resend_Req replays.
+//!   Resend_Req replays. The replay goes in front of the frames not fetched
+//!   yet, so a host that re-reads one chunk of a long result still gets the
+//!   rest.
 //!
 //! L2 requests are validated like the firmware does: a wrong REQ_LEN or
 //! parameter is GEN_ERR, an unknown REQ_ID is UNKNOWN_ERR. L3 packets
 //! larger than one 252-byte chunk are reassembled from Encrypted_Cmd_Req
 //! chunks (REQUEST_CONT until complete, then REQUEST_OK) and results are
 //! split into RESULT_CONT / RESULT_OK chunks.
+//!
+//! Like Tropic Square's model, the firmware reads the effective
+//! configuration (R-Config AND I-Config) once after a power cycle or a
+//! Startup_Req reboot and uses that snapshot until the next one;
+//! configuration writes are stored at once but take effect only then.
 
 use std::collections::VecDeque;
 
@@ -50,7 +57,7 @@ use crate::frame::{
 };
 use crate::handlers;
 use crate::handlers::l3::L3Outcome;
-use crate::object_store::Store;
+use crate::object_store::{Device, Store};
 use crate::personality::Personality;
 use crate::session::Session;
 
@@ -113,6 +120,11 @@ pub struct Chip {
     /// Encrypted_Cmd_Req chunk reassembly buffer and expected packet size.
     l3_packet: Vec<u8>,
     l3_expected: usize,
+    /// Effective configuration read at start-up; None until first needed
+    /// after a power cycle or reboot.
+    active_config: Option<Vec<u32>>,
+    /// An executed command may have changed the persistent store.
+    store_dirty: bool,
 }
 
 impl Chip {
@@ -131,6 +143,8 @@ impl Chip {
             busy_left: 0,
             l3_packet: Vec::new(),
             l3_expected: 0,
+            active_config: None,
+            store_dirty: false,
         }
     }
 
@@ -146,6 +160,19 @@ impl Chip {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// True (once) when a command executed since the last call may have
+    /// changed the persistent store, so the caller knows when to save it.
+    pub fn take_store_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.store_dirty)
+    }
+
+    /// The effective configuration in force, read from the store the first
+    /// time it is needed after a power cycle or reboot.
+    fn active_config(&mut self, dev: &Device) -> &[u32] {
+        self.active_config
+            .get_or_insert_with(|| dev.effective_config())
     }
 
     /// Power cycle: volatile state is lost, the chip boots into Application
@@ -258,8 +285,20 @@ impl Chip {
         if self.mode == Mode::Alarm {
             return;
         }
+        // Resend_Req replays the last response frame verbatim, in front of
+        // the frames the host has not fetched yet (libtropic re-reads a
+        // frame whose CRC failed and then carries on with the rest).
+        let resend =
+            matches!(parse_request(raw), Ok(r) if r.req_id == req::RESEND && r.data.is_empty());
+        if resend {
+            if let Some(f) = self.last_response.clone() {
+                self.queue.push_front(f);
+                self.busy_left = self.busy_polls;
+                return;
+            }
+        }
         let frames = self.process(store, raw);
-        // A new request discards responses the host never fetched.
+        // Any other request discards responses the host never fetched.
         self.queue = frames.into();
         self.busy_left = if self.queue.is_empty() {
             0
@@ -277,15 +316,10 @@ impl Chip {
         };
         let data = req.data;
 
-        // Resend_Req replays the last response frame verbatim.
+        // A Resend_Req that execute() could not replay: it carries data, or
+        // no response has been sent yet.
         if req.req_id == req::RESEND {
-            if !data.is_empty() {
-                return vec![build_response(status::GEN_ERR, &[])];
-            }
-            return match &self.last_response {
-                Some(f) => vec![f.clone()],
-                None => vec![build_response(status::GEN_ERR, &[])],
-            };
+            return vec![build_response(status::GEN_ERR, &[])];
         }
 
         match (self.mode, req.req_id) {
@@ -321,7 +355,7 @@ impl Chip {
                     STARTUP_MAINTENANCE_REBOOT => {
                         // CFG_START_UP.MAINTENANCE_ENA (bit 3) gates the
                         // maintenance restart.
-                        let ena = store.device.config(0x000) & (1 << 3) != 0;
+                        let ena = self.active_config(&store.device)[0x000 / 4] & (1 << 3) != 0;
                         self.reboot(if ena {
                             Mode::Maintenance
                         } else {
@@ -346,7 +380,7 @@ impl Chip {
                     return vec![gen_err()];
                 }
                 // CFG_SLEEP_MODE.SLEEP_MODE_EN (bit 0)
-                if store.device.config(0x018) & 1 == 0 {
+                if self.active_config(&store.device)[0x018 / 4] & 1 == 0 {
                     return vec![build_response(status::RESP_DISABLED, &[])];
                 }
                 self.drop_session();
@@ -359,6 +393,8 @@ impl Chip {
     fn reboot(&mut self, mode: Mode) {
         self.drop_session();
         self.mode = mode;
+        // The firmware reads the configuration again when it starts
+        self.active_config = None;
     }
 
     fn drop_session(&mut self) {
@@ -427,8 +463,23 @@ impl Chip {
             .as_ref()
             .map(|k| k.pkey_index)
             .unwrap_or(0);
-        let outcome =
-            handlers::l3::dispatch(&mut store.device, self.personality, pkey_index, &plaintext);
+        if self.active_config.is_none() {
+            self.active_config = Some(store.device.effective_config());
+        }
+        let cfg = self.active_config.as_deref().unwrap_or(&[]);
+        let outcome = handlers::l3::dispatch(
+            &mut store.device,
+            cfg,
+            self.personality,
+            pkey_index,
+            &plaintext,
+        );
+        if plaintext
+            .first()
+            .is_some_and(|&id| handlers::l3::mutates_store(id))
+        {
+            self.store_dirty = true;
+        }
         let result = match outcome {
             L3Outcome::Result(r) => r,
             L3Outcome::GenErr => {

@@ -28,8 +28,9 @@
 //!
 //! * a slot or index outside the command's range is UNAUTHORIZED;
 //! * every command is gated by its User Access Privilege register (the
-//!   effective R-Config AND I-Config value), bit `pkey_index` of the 8-bit
-//!   field covering the target;
+//!   effective R-Config AND I-Config value the firmware read at start-up,
+//!   passed in by the caller), bit `pkey_index` of the 8-bit field covering
+//!   the target;
 //! * an L3 size that does not fit the command is handled per firmware
 //!   personality (lenient on FW 0.1.2, L2 GEN_ERR + session close on 2.x).
 
@@ -150,6 +151,8 @@ enum Lenient {
 
 struct Ctx<'a> {
     dev: &'a mut Device,
+    /// Effective configuration in force (see `Device::effective_config`)
+    cfg: &'a [u32],
     p: Personality,
     pkey: u8,
 }
@@ -172,7 +175,8 @@ fn u16_at(b: &[u8], off: usize) -> u16 {
 impl Ctx<'_> {
     /// UAP check: field at bit `pos` of register `addr`, bit `pkey`.
     fn allowed(&self, addr: u16, pos: u32) -> bool {
-        (self.dev.config(addr) >> pos) & 0xff & (1u32 << self.pkey) != 0
+        let reg = self.cfg.get(addr as usize / 4).copied().unwrap_or(0);
+        (reg >> pos) & 0xff & (1u32 << self.pkey) != 0
     }
 }
 
@@ -213,7 +217,36 @@ fn es_lenient(id: u8, len: usize) -> Lenient {
     }
 }
 
-pub fn dispatch(dev: &mut Device, p: Personality, pkey: u8, plaintext: &[u8]) -> L3Outcome {
+/// Whether command `id` can change the persistent device state.
+pub fn mutates_store(id: u8) -> bool {
+    use cmd_id::*;
+    matches!(
+        id,
+        PAIRING_KEY_WRITE
+            | PAIRING_KEY_INVALIDATE
+            | R_CONFIG_WRITE
+            | R_CONFIG_ERASE
+            | I_CONFIG_WRITE
+            | R_MEM_DATA_WRITE
+            | R_MEM_DATA_ERASE
+            | ECC_KEY_GENERATE
+            | ECC_KEY_STORE
+            | ECC_KEY_ERASE
+            | MCOUNTER_INIT
+            | MCOUNTER_UPDATE
+            | MAC_AND_DESTROY
+    )
+}
+
+/// Execute one L3 command. `cfg` is the effective configuration in force,
+/// which gates every command by its User Access Privileges.
+pub fn dispatch(
+    dev: &mut Device,
+    cfg: &[u32],
+    p: Personality,
+    pkey: u8,
+    plaintext: &[u8],
+) -> L3Outcome {
     let Some(&id) = plaintext.first() else {
         return L3Outcome::Result(code(result::INVALID_CMD));
     };
@@ -247,7 +280,7 @@ pub fn dispatch(dev: &mut Device, p: Personality, pkey: u8, plaintext: &[u8]) ->
         return L3Outcome::Result(code(result::INVALID_CMD));
     }
 
-    let mut ctx = Ctx { dev, p, pkey };
+    let mut ctx = Ctx { dev, cfg, p, pkey };
     let c = plaintext;
 
     if !size_ok(p, id, c.len()) {
@@ -812,8 +845,11 @@ mod tests {
     use ed25519_dalek::{Signature as EdSignature, Verifier};
     use p256::ecdsa::{signature::hazmat::PrehashVerifier, VerifyingKey};
 
+    /// Each command runs as if right after a reboot: the configuration in
+    /// force is the one stored.
     fn run(dev: &mut Device, p: Personality, cmd: &[u8]) -> Vec<u8> {
-        match dispatch(dev, p, 0, cmd) {
+        let cfg = dev.effective_config();
+        match dispatch(dev, &cfg, p, 0, cmd) {
             L3Outcome::Result(r) => r,
             L3Outcome::GenErr => vec![],
         }
@@ -956,8 +992,9 @@ mod tests {
         assert_eq!(es(d, &[0x50, 4, 0]).len(), 8);
         assert_eq!(es(d, &[0x50]), vec![result::FAIL]);
         // 2.x: L2 GEN_ERR.
+        let cfg = d.effective_config();
         assert_eq!(
-            dispatch(d, Personality::Fw220, 0, &[0x50, 4, 0]),
+            dispatch(d, &cfg, Personality::Fw220, 0, &[0x50, 4, 0]),
             L3Outcome::GenErr
         );
     }
@@ -972,8 +1009,9 @@ mod tests {
             run(d, Personality::Es012, &[0x01, 9]),
             vec![result::UNAUTHORIZED]
         );
+        let cfg = d.effective_config();
         assert_eq!(
-            dispatch(d, Personality::Es012, 1, &[0x01, 9]),
+            dispatch(d, &cfg, Personality::Es012, 1, &[0x01, 9]),
             L3Outcome::Result(vec![result::OK, 9])
         );
     }

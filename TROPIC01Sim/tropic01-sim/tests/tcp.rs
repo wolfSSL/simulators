@@ -24,6 +24,7 @@
 //! Noise_KK1 handshake and chunked Encrypted_Cmd transfers.
 
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
@@ -42,6 +43,7 @@ use tropic01_sim::tcp_proto::{TcpFrame, TcpTag};
 struct ServerGuard {
     child: Child,
     port: u16,
+    store: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -73,6 +75,7 @@ fn spawn_server(personality: &str) -> ServerGuard {
             return ServerGuard {
                 child,
                 port,
+                store: dir.path().join("store.json"),
                 _dir: dir,
             };
         }
@@ -209,6 +212,14 @@ impl Host {
     /// Send an L3 command in 252-byte chunks, collect the result chunks and
     /// return the plaintext result, or the L2 status that ended it.
     fn l3(&mut self, cmd: &[u8]) -> Result<Vec<u8>, u8> {
+        self.l3_resend(cmd, None)
+    }
+
+    /// Like `l3`, but after response frame `resend_at` (0 = the
+    /// acknowledgement, 1 = the first result chunk, ...) ask for it again
+    /// with Resend_Req, as libtropic does after a CRC error, check the
+    /// replay is identical and carry on.
+    fn l3_resend(&mut self, cmd: &[u8], resend_at: Option<usize>) -> Result<Vec<u8>, u8> {
         let (kcmd, kres, nc, nr) = self.keys.unwrap();
         let ct = Aes256Gcm::new_from_slice(&kcmd)
             .unwrap()
@@ -227,10 +238,18 @@ impl Host {
             if f[0] != want {
                 return Err(f[0]);
             }
+            if i + 1 == chunks.len() && resend_at == Some(0) {
+                assert_eq!(self.l2(0x10, &[]), f, "replayed acknowledgement");
+            }
         }
         let mut res = Vec::new();
+        let mut index = 0;
         loop {
             let f = self.read();
+            index += 1;
+            if resend_at == Some(index) {
+                assert_eq!(self.l2(0x10, &[]), f, "replayed result chunk");
+            }
             match f[0] {
                 status::RESULT_CONT => res.extend_from_slice(&f[2..2 + f[1] as usize]),
                 status::RESULT_OK => {
@@ -326,4 +345,115 @@ fn power_on_clears_alarm() {
     h.tcp(TcpTag::PowerOn, vec![]);
     let f = h.l2(0x01, &[0x02, 0x00]);
     assert_eq!(f[0], status::REQUEST_OK);
+}
+
+#[test]
+fn resend_keeps_the_rest_of_a_result() {
+    let server = spawn_server("es-0.1.2");
+    let mut h = Host::connect(server.port);
+    assert_eq!(
+        h.handshake(0, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE),
+        status::REQUEST_OK
+    );
+    // A 600-byte ping answers with RESULT_CONT, RESULT_CONT, RESULT_OK
+    let mut cmd = vec![0x01];
+    cmd.extend((0..600).map(|i| i as u8));
+    for at in 0..=3 {
+        let r = h.l3_resend(&cmd, Some(at)).expect("ping");
+        assert_eq!(r[0], 0xc3);
+        assert_eq!(&r[1..], &cmd[1..], "resend after frame {at}");
+    }
+}
+
+#[test]
+fn chip_state_survives_reconnect() {
+    let server = spawn_server("es-0.1.2");
+
+    // The secure session belongs to the chip, not to the connection
+    let mut h1 = Host::connect(server.port);
+    assert_eq!(
+        h1.handshake(0, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE),
+        status::REQUEST_OK
+    );
+    let mut h2 = Host::connect(server.port);
+    h2.keys = h1.keys;
+    drop(h1);
+    assert_eq!(h2.l3(&[0x01, 5]), Ok(vec![0xc3, 5]));
+
+    // So is Maintenance mode
+    let f = h2.l2(0xb3, &[0x03]);
+    assert_eq!(f[0], status::REQUEST_OK);
+    drop(h2);
+    let mut h3 = Host::connect(server.port);
+    h3.tcp(TcpTag::SpiDriveCsnLow, vec![]);
+    assert_eq!(
+        h3.tcp(TcpTag::SpiSend, vec![GET_RESPONSE_REQ_ID]),
+        vec![0x05]
+    );
+    h3.tcp(TcpTag::SpiDriveCsnHigh, vec![]);
+    assert_eq!(h3.l2(0xb3, &[0x01])[0], status::REQUEST_OK);
+
+    // And Alarm mode, which only a power cycle clears
+    let mut hs = vec![0x42u8; 33];
+    hs[32] = 4;
+    h3.write(&build_request(0x02, &hs));
+    drop(h3);
+    let mut h4 = Host::connect(server.port);
+    h4.tcp(TcpTag::SpiDriveCsnLow, vec![]);
+    assert_eq!(
+        h4.tcp(TcpTag::SpiSend, vec![GET_RESPONSE_REQ_ID])[0] & 0x02,
+        0x02
+    );
+    h4.tcp(TcpTag::SpiDriveCsnHigh, vec![]);
+    h4.tcp(TcpTag::PowerOff, vec![]);
+    h4.tcp(TcpTag::PowerOn, vec![]);
+    assert_eq!(h4.l2(0x01, &[0x02, 0x00])[0], status::REQUEST_OK);
+}
+
+#[test]
+fn config_changes_take_effect_after_reboot() {
+    let server = spawn_server("es-0.1.2");
+    let mut h = Host::connect(server.port);
+    assert_eq!(
+        h.handshake(0, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE),
+        status::REQUEST_OK
+    );
+    // Allow only pairing slot 1 to ping (CFG_UAP_PING at 0x100)
+    assert_eq!(
+        h.l3(&[0x20, 0x00, 0x01, 0, 0x02, 0xff, 0xff, 0xff]),
+        Ok(vec![0xc3])
+    );
+    // Stored at once, but not in force yet
+    assert_eq!(
+        h.l3(&[0x21, 0x00, 0x01]),
+        Ok(vec![0xc3, 0, 0, 0, 0x02, 0xff, 0xff, 0xff])
+    );
+    assert_eq!(h.l3(&[0x01, 7]), Ok(vec![0xc3, 7]));
+    // In force after a reboot
+    assert_eq!(h.l2(0xb3, &[0x01])[0], status::REQUEST_OK);
+    assert_eq!(
+        h.handshake(0, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE),
+        status::REQUEST_OK
+    );
+    assert_eq!(h.l3(&[0x01, 7]), Ok(vec![0x01]));
+}
+
+#[test]
+fn store_is_saved_only_after_changes() {
+    let server = spawn_server("es-0.1.2");
+    std::fs::remove_file(&server.store).unwrap();
+    let mut h = Host::connect(server.port);
+    assert_eq!(
+        h.handshake(0, LT_SH0PRIV_ENG_SAMPLE, LT_SH0PUB_ENG_SAMPLE),
+        status::REQUEST_OK
+    );
+    assert_eq!(h.l3(&[0x01, 3]), Ok(vec![0xc3, 3]));
+    assert_eq!(h.l3(&[0x50, 16]).unwrap().len(), 20);
+    assert!(
+        !server.store.exists(),
+        "read-only commands rewrote the store"
+    );
+    // R_MEM_DATA_WRITE slot 7
+    assert_eq!(h.l3(&[0x40, 0x07, 0x00, 0, 0xaa]), Ok(vec![0xc3]));
+    assert!(server.store.exists(), "a write was not saved");
 }

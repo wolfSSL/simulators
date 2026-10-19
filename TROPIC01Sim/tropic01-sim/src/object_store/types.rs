@@ -117,10 +117,16 @@ pub struct Device {
 }
 
 impl Device {
-    /// Effective value of a configuration register: the R-Config value
-    /// AND-ed with the I-Config value, as the firmware applies it.
-    pub fn config(&self, addr: u16) -> u32 {
-        let i = (addr as usize) / 4;
-        self.r_config[i] & self.i_config[i]
+    /// Effective configuration: each R-Config register AND-ed with its
+    /// I-Config register. The firmware computes it at start-up and keeps
+    /// using it until the next power cycle or reboot (`chip::Chip` holds
+    /// that snapshot), so writes to the configuration objects take effect
+    /// only then.
+    pub fn effective_config(&self) -> Vec<u32> {
+        self.r_config
+            .iter()
+            .zip(&self.i_config)
+            .map(|(r, i)| r & i)
+            .collect()
     }
 }

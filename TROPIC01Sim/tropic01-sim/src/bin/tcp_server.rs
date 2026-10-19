@@ -35,10 +35,13 @@
 ///   0xFD INVALID             - server didn't recognise the tag
 ///   0xFE UNSUPPORTED         - tag known but not implemented
 ///
-/// Per-connection state: an `SpiEmulator` (CSN + SPI byte cursor) plus a
-/// Noise_KK1 `Session`. The persistent `Store` is shared across all
-/// connections via `Arc<Mutex<>>` -- that mirrors real silicon, where
-/// the chip has a single object store.
+/// There is one simulated chip: its volatile state (`Chip`: mode, Alarm,
+/// secure session, queued responses, the configuration in force) and its
+/// persistent `Store` are shared by every connection, as a real chip is by
+/// every host program that opens the SPI bus. A new connection is a new
+/// host talking to the same powered chip; only POWER_ON, POWER_OFF and
+/// RESET_TARGET reset the volatile state. The store is written to disk
+/// after a command that may have changed it.
 use std::env;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
@@ -55,8 +58,10 @@ const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 28992;
 const DEFAULT_STORE_PATH: &str = "tropic01_store.json";
 
-struct Config {
-    busy_polls: u32,
+/// The simulated chip.
+struct Sim {
+    chip: Chip,
+    store: Store,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -108,18 +113,18 @@ fn main() -> io::Result<()> {
         store.device.personality.name(),
         store_path.display()
     );
-    let store = Arc::new(Mutex::new(store));
-    let cfg = Arc::new(Config { busy_polls });
+    let mut chip = Chip::new(store.device.personality);
+    chip.set_busy_polls(busy_polls);
+    let sim = Arc::new(Mutex::new(Sim { chip, store }));
 
     let listener = TcpListener::bind((bind_addr.as_str(), port))?;
     eprintln!("[tropic01-sim] listening on {bind_addr}:{port}");
 
     for conn in listener.incoming() {
         let stream = conn?;
-        let store = Arc::clone(&store);
-        let cfg = Arc::clone(&cfg);
+        let sim = Arc::clone(&sim);
         thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, store, &cfg) {
+            if let Err(e) = handle_connection(stream, sim) {
                 eprintln!("[tropic01-sim] connection error: {e}");
             }
         });
@@ -127,7 +132,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>, cfg: &Config) -> io::Result<()> {
+fn handle_connection(stream: TcpStream, sim: Arc<Mutex<Sim>>) -> io::Result<()> {
     let peer = stream.peer_addr().ok();
     eprintln!("[tropic01-sim] connection from {peer:?}");
     stream.set_nodelay(true).ok();
@@ -136,12 +141,8 @@ fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>, cfg: &Config) 
     let mut reader = BufReader::new(stream);
     let mut writer = BufWriter::new(stream_for_writer);
 
-    let personality = store.lock().unwrap().device.personality;
-    let mut chip = Chip::new(personality);
-    chip.set_busy_polls(cfg.busy_polls);
-
     while let Some(frame) = TcpFrame::read_from(&mut reader)? {
-        let reply = handle_tcp_frame(&store, &mut chip, frame)?;
+        let reply = handle_tcp_frame(&mut sim.lock().unwrap(), frame)?;
         reply.write_to(&mut writer)?;
         writer.flush()?;
     }
@@ -150,11 +151,8 @@ fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>, cfg: &Config) 
     Ok(())
 }
 
-fn handle_tcp_frame(
-    store: &Arc<Mutex<Store>>,
-    chip: &mut Chip,
-    frame: TcpFrame,
-) -> io::Result<TcpFrame> {
+fn handle_tcp_frame(sim: &mut Sim, frame: TcpFrame) -> io::Result<TcpFrame> {
+    let Sim { chip, store } = sim;
     let tag = TcpTag::from_u8(frame.tag);
     match tag {
         TcpTag::SpiDriveCsnLow => {
@@ -166,14 +164,15 @@ fn handle_tcp_frame(
             Ok(TcpFrame::new(TcpTag::SpiDriveCsnHigh, vec![]))
         }
         TcpTag::SpiSend => {
-            let mut store_lock = store.lock().unwrap();
-            let miso = chip.transfer(&mut store_lock, &frame.payload);
-            store_lock.persist().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to persist store: {e}"),
-                )
-            })?;
+            let miso = chip.transfer(store, &frame.payload);
+            if chip.take_store_dirty() {
+                store.persist().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to persist store: {e}"),
+                    )
+                })?;
+            }
             Ok(TcpFrame::new(TcpTag::SpiSend, miso))
         }
         TcpTag::PowerOn | TcpTag::PowerOff | TcpTag::ResetTarget => {

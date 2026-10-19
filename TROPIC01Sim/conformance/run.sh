@@ -38,14 +38,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-TROPIC01_SIM_FRESH=1 TROPIC01_SIM_PORT="${PORT}" \
+TROPIC01_SIM_FRESH=1 TROPIC01_SIM_BIND=127.0.0.1 TROPIC01_SIM_PORT="${PORT}" \
     TROPIC01_SIM_STORE="${WORK}/store.json" \
     "${SIM_BIN}" > "${WORK}/sim.log" 2>&1 &
 SIM_PID=$!
 
+# Wait for this simulator to report that it is listening, so the probe can
+# never talk to another one that already holds the port.
 READY=0
 for _ in $(seq 1 50); do
-    if (echo > /dev/tcp/127.0.0.1/"${PORT}") 2>/dev/null; then
+    if ! kill -0 "${SIM_PID}" 2>/dev/null; then
+        echo "ERROR: simulator exited during start-up:" >&2
+        cat "${WORK}/sim.log" >&2
+        exit 1
+    fi
+    if grep -q "listening on 127.0.0.1:${PORT}\$" "${WORK}/sim.log"; then
         READY=1
         break
     fi
@@ -53,10 +60,12 @@ for _ in $(seq 1 50); do
 done
 if [ "${READY}" -ne 1 ]; then
     echo "ERROR: simulator did not start on port ${PORT}" >&2
+    cat "${WORK}/sim.log" >&2
     exit 1
 fi
 
-TROPIC01_SIM_PORT="${PORT}" "${PROBE_BIN}" > "${LOG}" 2>&1
+TROPIC01_SIM_HOST=127.0.0.1 TROPIC01_SIM_PORT="${PORT}" \
+    "${PROBE_BIN}" > "${LOG}" 2>&1
 RC=$?
 if [ "${RC}" -ne 0 ] || ! grep -q "^CONFORMANCE DONE" "${LOG}"; then
     echo "ERROR: probe failed (rc=${RC}), see ${LOG}" >&2

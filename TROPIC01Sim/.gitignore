@@ -4,3 +4,5 @@ target/
 *.so
 tropic01_store.json
 Cargo.lock
+conformance/build/
+conformance.log

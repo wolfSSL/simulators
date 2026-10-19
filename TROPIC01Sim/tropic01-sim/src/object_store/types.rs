@@ -23,9 +23,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Curves the TROPIC01 ECC engine supports. P-256 and Ed25519 are the only
-/// two listed in `lt_l3_api_structs.h::lt_l3_ecc_key_generate_cmd_t`
-/// (CURVE values 1 and 2).
+use crate::personality::Personality;
+
+/// Bump when the persisted JSON layout changes incompatibly.
+pub const STORE_FORMAT_VERSION: u32 = 2;
+
+/// Number of 32-bit registers in the R-Config and I-Config objects
+/// (addresses 0x000..0x1FC).
+pub const CONFIG_REGISTERS: usize = 128;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CurveKind {
     P256,
@@ -49,9 +55,6 @@ impl CurveKind {
     }
 }
 
-/// `ECC_Key_Read.origin` field. The chip distinguishes keys it generated
-/// internally from those uploaded with `ECC_Key_Store`. wolfSSL's port
-/// reads this back via `lt_ecc_key_read` but treats both equivalently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyOrigin {
     Generated,
@@ -67,58 +70,57 @@ impl KeyOrigin {
     }
 }
 
-/// One ECC key slot. Private bytes are stored unmodified; the public key
-/// is derived on demand by the handler so we don't have to re-derive it
-/// across crate version bumps.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EccSlot {
     pub curve: CurveKind,
     pub origin: KeyOrigin,
-    /// Raw private scalar bytes. 32B for both P-256 and Ed25519.
+    /// P-256: big-endian scalar. Ed25519: the 32-byte RFC 8032 secret.
     pub private_key: Vec<u8>,
 }
 
-/// One R-memory slot. The chip allows arbitrary host-defined bytes up to
-/// 444B per slot (`TR01_L3_R_MEM_DATA_*`); wolfSSL only ever stores 32B
-/// values (AES key, IV, Ed25519 priv, Ed25519 pub).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RMemSlot {
-    pub data: Vec<u8>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingState {
+    Written,
+    Invalidated,
 }
 
-/// One pairing-key slot. Holds the host's static X25519 public key the
-/// chip will accept for handshakes targeting this slot. `is_valid` mirrors
-/// the chip's per-slot "invalidated" bit (set by Pairing_Key_Invalidate).
+/// A pairing key slot that is absent from `Device::pairing_slots` is blank.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairingSlot {
     pub public_key: [u8; 32],
-    pub is_valid: bool,
+    pub state: PairingState,
 }
 
-/// Persistent on-disk device state. All fields together define the
-/// chip's identity, pairing trust anchors, and persistent key/data store.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Device {
-    /// 12-byte chip ID (silicon revision + unique device ID), returned by
-    /// GET_INFO(object_id=CHIP_ID).
-    pub chip_id: [u8; 12],
-    /// Chip's static X25519 keypair (STPRIV/STPUB). The Noise_KK1 handshake
-    /// uses STPUB. STPRIV never leaves the chip in real silicon.
+    pub format_version: u32,
+    pub personality: Personality,
+    /// 128-byte CHIP_ID object.
+    pub chip_id: Vec<u8>,
     pub st_priv: [u8; 32],
     pub st_pub: [u8; 32],
-    /// 4-cert "cert store" blob returned by GET_INFO(X509_CERTIFICATE).
-    /// libtropic reads this in 128-byte chunks and parses the leading
-    /// 10-byte header (`[version=1][num_certs=4][len_cert0..len_cert3 as
-    /// 4 BE u16]`) followed by `num_certs` concatenated DER blobs. Cert 0
-    /// is the device cert and must contain the X25519 SPKI carrying
-    /// STPUB at a libtropic-recognisable ASN.1 offset; certs 1..3 are
-    /// padding so the chunked reader walks all four boundaries cleanly.
+    /// GET_INFO(X509_CERTIFICATE) blob: `[version][num_certs][4 x BE u16
+    /// lengths][certs...]`.
     pub cert_store: Vec<u8>,
-    /// Pairing-key slots 0..=3 (`TR01_L3_PAIRING_KEY_SLOT_*`).
     pub pairing_slots: BTreeMap<u8, PairingSlot>,
-    /// ECC key slots. Slot indices follow libtropic's per-application
-    /// convention; wolfSSL's port uses slot 1 for Ed25519.
+    pub r_config: Vec<u32>,
+    pub i_config: Vec<u32>,
     pub ecc_slots: BTreeMap<u16, EccSlot>,
-    /// R-memory slots (host-defined arbitrary data).
-    pub r_mem_slots: BTreeMap<u16, RMemSlot>,
+    /// R-Memory user data slots; absent means empty.
+    pub r_mem_slots: BTreeMap<u16, Vec<u8>>,
+    /// Monotonic counters; absent means not initialized.
+    pub mcounters: BTreeMap<u16, u32>,
+    /// MAC-and-Destroy slots; absent means the erased value (all 0xFF).
+    pub macandd_slots: BTreeMap<u16, [u8; 32]>,
+    /// Device-unique MAC-and-Destroy keys used by F1 and F2.
+    pub macandd_keys: [[u8; 32]; 2],
+}
+
+impl Device {
+    /// Effective value of a configuration register: the R-Config value
+    /// AND-ed with the I-Config value, as the firmware applies it.
+    pub fn config(&self, addr: u16) -> u32 {
+        let i = (addr as usize) / 4;
+        self.r_config[i] & self.i_config[i]
+    }
 }

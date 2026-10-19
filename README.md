@@ -26,12 +26,13 @@ that pipes the I2C transport over TCP.
 ## TROPIC01Sim
 
 The [TROPIC01Sim](TROPIC01Sim/) is a simulator for the Tropic Square TROPIC01
-secure element. It speaks libtropic's "TROPIC01 Model" wire protocol over
-TCP and performs the full Noise_KK1_25519_AESGCM_SHA256 secure-channel
-handshake, then answers the L3 commands the wolfSSL TROPIC01 port exercises:
-RNG, ECC keygen/read for P-256 + Ed25519, R-memory read/write, and the
-pairing-key surface. The simulator is consumed unmodified by libtropic via
-its `hal/posix/tcp/` HAL.
+secure element. It speaks libtropic's "TROPIC01 model" protocol over TCP
+(libtropic's unmodified `hal/posix/tcp/` HAL), emulates the chip's SPI side,
+runs the Noise_KK1_25519_AESGCM_SHA256 secure channel and implements the full
+L3 command set: RNG, P-256 and Ed25519 keys and signatures, R-Memory,
+monotonic counters, MAC-and-Destroy, pairing keys and configuration. Its
+default firmware personality was validated against a real chip with a
+conformance probe that also runs in CI.
 
 ## STM32Sim
 

@@ -19,18 +19,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
+pub mod certs;
+pub mod chip;
 pub mod crc;
-pub mod dispatch;
 pub mod frame;
 pub mod handlers;
 pub mod object_store;
+pub mod personality;
 pub mod session;
-pub mod spi;
 pub mod tcp_proto;
 
-pub use dispatch::Dispatcher;
+pub use chip::Chip;
 pub use frame::{build_response, parse_request, FrameError};
 pub use object_store::Store;
+pub use personality::Personality;
 pub use session::Session;
-pub use spi::SpiEmulator;
 pub use tcp_proto::{TcpFrame, TcpTag};

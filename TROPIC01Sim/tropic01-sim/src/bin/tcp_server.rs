@@ -46,15 +46,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use tropic01_sim::dispatch::Dispatcher;
-use tropic01_sim::object_store::Store;
-use tropic01_sim::session::Session;
-use tropic01_sim::spi::{SpiEmulator, SpiOutcome};
+use tropic01_sim::chip::Chip;
+use tropic01_sim::object_store::{Provisioning, Store};
+use tropic01_sim::personality::Personality;
 use tropic01_sim::tcp_proto::{TcpFrame, TcpTag};
 
 const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 28992;
 const DEFAULT_STORE_PATH: &str = "tropic01_store.json";
+
+struct Config {
+    busy_polls: u32,
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(env::var(name).as_deref(), Ok(v) if !v.is_empty() && v != "0")
+}
 
 fn main() -> io::Result<()> {
     let bind_addr = env::var("TROPIC01_SIM_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -65,13 +72,44 @@ fn main() -> io::Result<()> {
     let store_path = env::var("TROPIC01_SIM_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_STORE_PATH));
-
-    let store = if env::var_os("TROPIC01_SIM_FRESH").is_some() {
-        Store::fresh()
-    } else {
-        Store::load_or_init(&store_path)?
+    let personality = match env::var("TROPIC01_SIM_PERSONALITY") {
+        Ok(name) => Personality::from_name(&name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown TROPIC01_SIM_PERSONALITY {name:?} (es-0.1.2, 2.2.0)"),
+            )
+        })?,
+        Err(_) => Personality::default(),
     };
+    let prov = Provisioning {
+        personality,
+        wolfssl_fixtures: env_flag("TROPIC01_SIM_WOLFSSL_FIXTURES"),
+    };
+    let busy_polls = env::var("TROPIC01_SIM_BUSY_POLLS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let store = if env_flag("TROPIC01_SIM_FRESH") {
+        Store::create(&store_path, prov)?
+    } else {
+        Store::load_or_init(&store_path, prov)?
+    };
+    if env::var("TROPIC01_SIM_PERSONALITY").is_ok() && store.device.personality != personality {
+        eprintln!(
+            "[tropic01-sim] warning: {} was provisioned as {}, ignoring \
+             TROPIC01_SIM_PERSONALITY (set TROPIC01_SIM_FRESH=1 to reprovision)",
+            store_path.display(),
+            store.device.personality.name()
+        );
+    }
+    eprintln!(
+        "[tropic01-sim] personality {}, store {}",
+        store.device.personality.name(),
+        store_path.display()
+    );
     let store = Arc::new(Mutex::new(store));
+    let cfg = Arc::new(Config { busy_polls });
 
     let listener = TcpListener::bind((bind_addr.as_str(), port))?;
     eprintln!("[tropic01-sim] listening on {bind_addr}:{port}");
@@ -79,8 +117,9 @@ fn main() -> io::Result<()> {
     for conn in listener.incoming() {
         let stream = conn?;
         let store = Arc::clone(&store);
+        let cfg = Arc::clone(&cfg);
         thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, store) {
+            if let Err(e) = handle_connection(stream, store, &cfg) {
                 eprintln!("[tropic01-sim] connection error: {e}");
             }
         });
@@ -88,21 +127,21 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>) -> io::Result<()> {
+fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>, cfg: &Config) -> io::Result<()> {
     let peer = stream.peer_addr().ok();
     eprintln!("[tropic01-sim] connection from {peer:?}");
     stream.set_nodelay(true).ok();
 
-    // Buffer in/out independently so the borrow checker doesn't fight us.
     let stream_for_writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     let mut writer = BufWriter::new(stream_for_writer);
 
-    let mut spi = SpiEmulator::new();
-    let mut session = Session::new();
+    let personality = store.lock().unwrap().device.personality;
+    let mut chip = Chip::new(personality);
+    chip.set_busy_polls(cfg.busy_polls);
 
     while let Some(frame) = TcpFrame::read_from(&mut reader)? {
-        let reply = handle_tcp_frame(&store, &mut spi, &mut session, frame)?;
+        let reply = handle_tcp_frame(&store, &mut chip, frame)?;
         reply.write_to(&mut writer)?;
         writer.flush()?;
     }
@@ -113,63 +152,43 @@ fn handle_connection(stream: TcpStream, store: Arc<Mutex<Store>>) -> io::Result<
 
 fn handle_tcp_frame(
     store: &Arc<Mutex<Store>>,
-    spi: &mut SpiEmulator,
-    session: &mut Session,
+    chip: &mut Chip,
     frame: TcpFrame,
 ) -> io::Result<TcpFrame> {
     let tag = TcpTag::from_u8(frame.tag);
     match tag {
         TcpTag::SpiDriveCsnLow => {
-            spi.csn_low();
+            chip.csn_low();
             Ok(TcpFrame::new(TcpTag::SpiDriveCsnLow, vec![]))
         }
         TcpTag::SpiDriveCsnHigh => {
-            spi.csn_high();
+            chip.csn_high();
             Ok(TcpFrame::new(TcpTag::SpiDriveCsnHigh, vec![]))
         }
         TcpTag::SpiSend => {
-            let (miso, outcome) = spi.spi_transfer(&frame.payload);
-            if matches!(outcome, SpiOutcome::RequestComplete) {
-                let raw = spi.take_request();
-                let mut store_lock = store.lock().unwrap();
-                let response = Dispatcher::dispatch(&mut store_lock, session, &raw);
-                store_lock.persist().map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to persist store: {e}"),
-                    )
-                })?;
-                drop(store_lock);
-                spi.stage_response(Some(response));
-            }
+            let mut store_lock = store.lock().unwrap();
+            let miso = chip.transfer(&mut store_lock, &frame.payload);
+            store_lock.persist().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to persist store: {e}"),
+                )
+            })?;
             Ok(TcpFrame::new(TcpTag::SpiSend, miso))
         }
-        TcpTag::PowerOn | TcpTag::PowerOff => {
-            // Cold boot from libtropic's perspective. Reset volatile state
-            // -- session keys included -- but leave the persistent store.
-            spi.csn_high();
-            session.abort();
+        TcpTag::PowerOn | TcpTag::PowerOff | TcpTag::ResetTarget => {
+            // Volatile state (session, queued responses, Alarm mode) is
+            // lost; the persistent store survives.
+            chip.power_cycle();
             Ok(TcpFrame::new(tag, vec![]))
         }
         TcpTag::Wait => {
-            // Host requested a real-time delay (the model server sleeps);
-            // we don't actually sleep -- the simulator is instant.
+            // The simulator answers instantly, so delays need no real time.
             Ok(TcpFrame::new(TcpTag::Wait, vec![]))
         }
-        TcpTag::ResetTarget => {
-            spi.csn_high();
-            spi.stage_response(None);
-            session.abort();
-            Ok(TcpFrame::new(TcpTag::ResetTarget, vec![]))
-        }
-        TcpTag::Invalid | TcpTag::Unsupported => {
-            // Host sent us one of its own error sentinels back -- treat
-            // as a protocol error and close the connection by surfacing
-            // io::ErrorKind::InvalidData.
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected client tag {:#04x}", frame.tag),
-            ))
-        }
+        TcpTag::Invalid | TcpTag::Unsupported => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected client tag {:#04x}", frame.tag),
+        )),
     }
 }

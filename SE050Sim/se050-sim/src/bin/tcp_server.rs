@@ -120,7 +120,16 @@ fn main() {
 
     eprintln!("[se050-sim] Listening on port {}", port);
 
-    let store = Arc::new(Mutex::new(ObjectStore::new()));
+    // Optional persistence: with SE050_SIM_STORE=/path/store.json the object store survives
+    // restarts, like a real secure element keeps its objects across power cycles.
+    let store = match std::env::var("SE050_SIM_STORE") {
+        Ok(path) if !path.is_empty() => {
+            eprintln!("[se050-sim] Persisting objects to {}", path);
+            ObjectStore::with_persistence(std::path::PathBuf::from(path))
+        }
+        _ => ObjectStore::new(),
+    };
+    let store = Arc::new(Mutex::new(store));
 
     for stream in listener.incoming() {
         match stream {

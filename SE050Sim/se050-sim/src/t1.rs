@@ -168,6 +168,8 @@ pub struct T1Responder {
     selected_ssd: bool,
     /// Applet sessions (CreateSession / ProcessSessionCmd), reset by SELECT.
     applet_sessions: crate::applet_session::AppletSessions,
+    /// Last single-frame response, for an R-block asking for a retransmission.
+    last_response: Vec<Vec<u8>>,
 }
 
 impl T1Responder {
@@ -182,6 +184,7 @@ impl T1Responder {
             scp03: Scp03State::new(),
             selected_ssd: false,
             applet_sessions: Default::default(),
+            last_response: Vec::new(),
         }
     }
 
@@ -206,6 +209,13 @@ impl T1Responder {
             }
             FrameType::IFrame { seq, multi } => {
                 self.handle_i_frame(seq, multi, &frame.payload, store)
+            }
+            FrameType::RFrame { err, .. } if err != 0 => {
+                // R-block with an error indication: the host did not get our
+                // last block (e.g. it gave up waiting) and asks for it again.
+                // Without an answer the host and a bridge in between would
+                // wait forever.
+                self.last_response.clone()
             }
             FrameType::RFrame { .. } => {
                 // R-frames during multi-frame response sending
@@ -432,7 +442,9 @@ impl T1Responder {
             let (header, payload_crc) = build_frame(self.nad_se2hd, ft, response_bytes);
             chunks.push(header);
             chunks.push(payload_crc);
+            self.last_response = chunks.clone();
         } else {
+            self.last_response.clear();
             // Multi-frame response
             let mut offset = 0;
             while offset < response_bytes.len() {
@@ -462,6 +474,23 @@ impl T1Responder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_r_block_with_error_repeats_last_response() {
+        let mut t1 = T1Responder::new(0x5A);
+        let mut store = ObjectStore::new();
+        // I-block 0 carrying SELECT of the IoT applet
+        let select = [0x00, 0xA4, 0x04, 0x00, 0x10, 0xA0, 0x00, 0x00, 0x03, 0x96, 0x54, 0x53, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00];
+        let (h, p) = build_frame(0x5A, FrameType::IFrame { seq: 0, multi: false }, &select);
+        let first = t1.process_frame(&[h, p].concat(), &mut store);
+        assert_eq!(first.len(), 2);
+        // R-block, N(R) = 1, error bits set: the same response again
+        let (h, p) = build_frame(0x5A, FrameType::RFrame { seq: 1, err: 0x01 }, &[]);
+        assert_eq!(t1.process_frame(&[h, p].concat(), &mut store), first);
+        // without error bits (chaining acknowledgement) nothing is sent
+        let (h, p) = build_frame(0x5A, FrameType::RFrame { seq: 1, err: 0x00 }, &[]);
+        assert!(t1.process_frame(&[h, p].concat(), &mut store).is_empty());
+    }
 
     #[test]
     fn test_crc16() {

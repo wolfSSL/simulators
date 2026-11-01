@@ -440,10 +440,19 @@ fn handle_read_attributes(
     let mut attributes = Vec::new();
     attributes.extend_from_slice(&obj_id);
     attributes.push(object.type_code(true));
-    attributes.push(0x01); // kSE05x_SetIndicator_NOT_SET
-    attributes.extend_from_slice(&[0x00, 0x00]); // minimum AEAD tag length
-    attributes.extend_from_slice(&[0x00; 4]); // owner: unauthenticated session
-    attributes.extend_from_slice(&[0x00, 0x00]); // RFU
+    if let Some(auth) = store.auth_state(&obj_id) {
+        // Authentication Object layout (AN12543 table 3): indicator SET,
+        // failed attempts, owner, maximum attempts.
+        attributes.push(0x02); // kSE05x_SetIndicator_SET
+        attributes.extend_from_slice(&auth.attempts.to_be_bytes());
+        attributes.extend_from_slice(&[0x00; 4]);
+        attributes.extend_from_slice(&auth.max_attempts.to_be_bytes());
+    } else {
+        attributes.push(0x01); // kSE05x_SetIndicator_NOT_SET
+        attributes.extend_from_slice(&[0x00, 0x00]); // minimum AEAD tag length
+        attributes.extend_from_slice(&[0x00; 4]); // owner: unauthenticated session
+        attributes.extend_from_slice(&[0x00, 0x00]); // RFU
+    }
     if let Some(metadata) = store.metadata(&obj_id) {
         if let Some(policy) = &metadata.policy {
             attributes.extend_from_slice(policy);

@@ -32,6 +32,19 @@ pub struct ObjectMetadata {
     /// trust-provisioned=3.
     #[serde(default = "default_object_origin")]
     pub origin: u8,
+    /// Authentication Object (created with INS_AUTH_OBJECT): it can open an
+    /// applet session, and its failed attempts are counted (AN12543 3.2.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthState>,
+}
+
+/// Attempt counter of an Authentication Object. With `max_attempts` != 0 the
+/// object no longer authenticates once `attempts` reaches it; a successful
+/// authentication resets `attempts` to 0. Persisted with the object.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthState {
+    pub max_attempts: u16,
+    pub attempts: u16,
 }
 
 impl Default for ObjectMetadata {
@@ -39,6 +52,7 @@ impl Default for ObjectMetadata {
         Self {
             policy: None,
             origin: default_object_origin(),
+            auth: None,
         }
     }
 }

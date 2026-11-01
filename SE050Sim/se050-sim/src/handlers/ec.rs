@@ -147,6 +147,15 @@ pub fn handle_write_ec_key(
             creation_policy,
             if generated { 0x02 } else { 0x01 },
         );
+        // INS_AUTH_OBJECT: an ECKey Authentication Object, with its maximum
+        // number of failed attempts (0 = unlimited, at most 0x7FFF).
+        if apdu.ins & 0x40 != 0 {
+            let max = tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS)
+                .filter(|t| t.value.len() == 2)
+                .map(|t| u16::from_be_bytes([t.value[0], t.value[1]]) & 0x7FFF)
+                .unwrap_or(0);
+            store.set_auth_object(obj_id, max);
+        }
     }
     response
 }

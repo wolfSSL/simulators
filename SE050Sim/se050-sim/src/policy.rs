@@ -33,6 +33,7 @@
 pub const POLICY_OBJ_ALLOW_READ: u32 = 0x0020_0000;
 pub const POLICY_OBJ_ALLOW_WRITE: u32 = 0x0010_0000;
 pub const POLICY_OBJ_ALLOW_DELETE: u32 = 0x0004_0000;
+pub const POLICY_OBJ_ALLOW_SIGN: u32 = 0x1000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPolicy;
@@ -75,6 +76,24 @@ pub fn ar_header_union(value: &[u8]) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// Access rule header for one Authentication Object ID (all zeros = the
+/// default session). None when the policy has no rule for that owner or is
+/// malformed.
+pub fn ar_header_for(value: &[u8], owner: &[u8; 4]) -> Option<u32> {
+    let mut rest = value;
+    while !rest.is_empty() {
+        let len = rest[0] as usize;
+        if len < 8 || rest.len() < 1 + len {
+            return None;
+        }
+        if rest[1..5] == owner[..] {
+            return Some(u32::from_be_bytes([rest[5], rest[6], rest[7], rest[8]]));
+        }
+        rest = &rest[1 + len..];
+    }
+    None
 }
 
 #[cfg(test)]

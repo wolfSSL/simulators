@@ -166,6 +166,8 @@ pub struct T1Responder {
     /// PUT KEY is valid only after selecting the Security Domain, not while
     /// the IoT applet is selected.
     selected_ssd: bool,
+    /// Applet sessions (CreateSession / ProcessSessionCmd), reset by SELECT.
+    applet_sessions: crate::applet_session::AppletSessions,
 }
 
 impl T1Responder {
@@ -179,6 +181,7 @@ impl T1Responder {
             apdu_reassembly: Vec::new(),
             scp03: Scp03State::new(),
             selected_ssd: false,
+            applet_sessions: Default::default(),
         }
     }
 
@@ -299,6 +302,7 @@ impl T1Responder {
             // SELECT terminates any secure channel, then proceeds plain.
             if cla == 0x00 && ins == 0xA4 {
                 self.scp03.reset();
+                self.applet_sessions.reset();
                 self.selected_ssd = ParsedApdu::parse(apdu_bytes)
                     .map(|a| crate::handlers::session::selects_ssd(&a))
                     .unwrap_or(false);
@@ -343,6 +347,9 @@ impl T1Responder {
                 let inner = match unwrapped {
                     Ok(a) => a,
                     Err(sw) => {
+                        if std::env::var("SE050_SIM_TRACE").map(|v| v == "1").unwrap_or(false) {
+                            eprintln!("[trace] platform unwrap failed {:04x}, channel closed", sw);
+                        }
                         self.scp03.reset();
                         return ApduResponse::error(sw);
                     }
@@ -367,7 +374,12 @@ impl T1Responder {
                         }
                     }
                 } else {
-                    dispatch::dispatch(&inner, store, true)
+                    let r = match self.applet_sessions.intercept(&inner, store, true) {
+                        Some(r) => r,
+                        None => dispatch::dispatch(&inner, store, true),
+                    };
+                    crate::applet_session::trace("platform", &inner, r.sw);
+                    r
                 };
                 return match &mut self.scp03 {
                     Scp03State::Active(sess) => sess.wrap_response(resp),
@@ -391,7 +403,14 @@ impl T1Responder {
         }
 
         match ParsedApdu::parse(apdu_bytes) {
-            Ok(apdu) => dispatch::dispatch(&apdu, store, false),
+            Ok(apdu) => {
+                let r = match self.applet_sessions.intercept(&apdu, store, false) {
+                    Some(r) => r,
+                    None => dispatch::dispatch(&apdu, store, false),
+                };
+                crate::applet_session::trace("plain", &apdu, r.sw);
+                r
+            }
             Err(e) => {
                 log::warn!("Failed to parse APDU: {:?}", e);
                 ApduResponse::error(0x6700) // Wrong length

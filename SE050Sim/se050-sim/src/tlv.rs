@@ -66,6 +66,12 @@ pub fn parse_tlvs(data: &[u8]) -> Result<Vec<Tlv>, TlvError> {
             }
             let len = ((data[offset + 2] as usize) << 8) | (data[offset + 3] as usize);
             (len, 4)
+        } else if data[offset + 1] == 0x81 {
+            // One extra length byte (128..255), as the NXP host encodes them.
+            if offset + 3 > data.len() {
+                return Err(TlvError::TooShort);
+            }
+            (data[offset + 2] as usize, 3)
         } else if data[offset + 1] < 0x80 {
             (data[offset + 1] as usize, 2)
         } else {

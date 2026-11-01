@@ -91,6 +91,42 @@ fn default_curves() -> HashMap<u8, u8> {
     (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
 }
 
+/// Writes the persisted store without holding up the APDU being processed:
+/// a background thread writes the latest snapshot (to a temporary file, then
+/// renamed). A synchronous write in the command path took up to a second on a
+/// busy disk, longer than hosts wait for an answer (NXP's T=1 stack then asks
+/// for a retransmission). Unit tests write synchronously.
+#[cfg(not(test))]
+fn write_store(path: &std::path::Path, json: String) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    static WRITER: OnceLock<Mutex<Sender<(PathBuf, String)>>> = OnceLock::new();
+    let tx = WRITER.get_or_init(|| {
+        let (tx, rx) = channel::<(PathBuf, String)>();
+        std::thread::spawn(move || {
+            while let Ok((mut p, mut j)) = rx.recv() {
+                while let Ok((p2, j2)) = rx.try_recv() {
+                    p = p2;
+                    j = j2;
+                }
+                let tmp = p.with_extension("json.tmp");
+                if std::fs::write(&tmp, &j).is_ok() {
+                    let _ = std::fs::rename(&tmp, &p);
+                }
+            }
+        });
+        Mutex::new(tx)
+    });
+    if let Ok(tx) = tx.lock() {
+        let _ = tx.send((path.to_path_buf(), json));
+    }
+}
+
+#[cfg(test)]
+fn write_store(path: &std::path::Path, json: String) {
+    let _ = std::fs::write(path, json);
+}
+
 impl ObjectStore {
     pub fn new() -> Self {
         Self {
@@ -287,7 +323,7 @@ impl ObjectStore {
             "platform_scp": self.platform_scp,
         });
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
-            let _ = std::fs::write(path, json);
+            write_store(path, json);
         }
     }
 

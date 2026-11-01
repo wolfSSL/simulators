@@ -210,6 +210,14 @@ impl Scp03State {
     /// EXTERNAL AUTHENTICATE (CLA 0x84 INS 0x82). `raw` is the full APDU:
     /// 84 82 <level> 00 10 <host cryptogram 8> <C-MAC 8>. Any failure drops
     /// the channel to Idle.
+    /// The established channel, once EXTERNAL AUTHENTICATE has succeeded.
+    pub fn into_session(self) -> Option<Session> {
+        match self {
+            Scp03State::Active(s) => Some(s),
+            _ => None,
+        }
+    }
+
     pub fn external_authenticate(&mut self, raw: &[u8]) -> ApduResponse {
         // Take the pending state out; every failure path leaves us Idle.
         let p = match std::mem::replace(self, Scp03State::Idle) {

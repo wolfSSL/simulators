@@ -252,6 +252,18 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
             creation_policy,
             if generated { 0x02 } else { 0x01 },
         );
+        // INS_AUTH_OBJECT: an AESKey Authentication Object (AES-128 only).
+        if apdu.ins & 0x40 != 0 {
+            if !matches!(store.get(&obj_id), Some(SecureObject::AESKey { key }) if key.len() == 16) {
+                store.remove(&obj_id);
+                return ApduResponse::error(SW_WRONG_DATA);
+            }
+            let max = tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS)
+                .filter(|t| t.value.len() == 2)
+                .map(|t| u16::from_be_bytes([t.value[0], t.value[1]]) & 0x7FFF)
+                .unwrap_or(0);
+            store.set_auth_object(obj_id, max);
+        }
     }
     response
 }

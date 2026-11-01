@@ -94,6 +94,10 @@ pub struct ObjectStore {
 /// own NIST P-256 key pair used for ECKey session key agreement.
 pub const RESERVED_ID_ECKEY_SESSION: [u8; 4] = [0x7F, 0xFF, 0x02, 0x01];
 
+/// The SE's ECC attestation key pair (SSS_SE05X_RESID_ATTESTATION_KEY in Plug
+/// & Trust): signs attested reads; hosts read its public key from the SE.
+pub const RESERVED_ID_ATTESTATION_KEY: [u8; 4] = [0xF0, 0x00, 0x00, 0x12];
+
 fn default_curves() -> HashMap<u8, u8> {
     // P-192, P-224, P-256, P-384, P-521 fully parameterized.
     (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
@@ -238,20 +242,56 @@ impl ObjectStore {
         self.session_owner = owner;
     }
 
-    /// The SE's ECKey session key pair, created on first use and persisted.
-    pub fn ensure_eckey_session_key(&mut self) {
-        if self.objects.contains_key(&RESERVED_ID_ECKEY_SESSION) {
-            return;
+    /// SE050_SIM_DEMO_AUTH=1: the demo Authentication Objects that NXP Plug &
+    /// Trust's examples use (sss/ex/inc/ex_sss_auth.h, ex_sss_objid.h), so its
+    /// UserID, AESKey and ECKey session modes can run against the simulator:
+    /// 0x7DA00001 UserID C0 01 02 03 04, 0x7DA00002 AESKey 40..4F, 0x7DA00003
+    /// ECKey with the public key of EX_SSS_AUTH_SE05X_KEY_HOST_ECDSA_KEY. No
+    /// policy, unlimited attempts. Created once, like trust provisioning.
+    pub fn ensure_demo_auth_objects(&mut self) {
+        const USERID: [u8; 4] = [0x7D, 0xA0, 0x00, 0x01];
+        const AESKEY: [u8; 4] = [0x7D, 0xA0, 0x00, 0x02];
+        const ECKEY: [u8; 4] = [0x7D, 0xA0, 0x00, 0x03];
+        const ECKEY_PUB: &str = "043c9e47edf051a3589f67302d22567c2e17229e8883338ec3b7d527f9ee71d0a81aae7fe21caa6677783aa88da6d6a8ad5ec53b10bc0b11094482f04d24b5bec4";
+        if !self.objects.contains_key(&USERID) {
+            self.objects.insert(USERID, SecureObject::UserID { value: vec![0xC0, 0x01, 0x02, 0x03, 0x04] });
+            self.metadata.insert(USERID, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
         }
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
-        let pk = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
-        self.objects.insert(RESERVED_ID_ECKEY_SESSION, SecureObject::ECKeyPair {
-            curve: crate::object_store::types::ECCurve::NistP256,
-            private_key: sk.to_bytes().to_vec(),
-            public_key: pk,
-        });
+        if !self.objects.contains_key(&AESKEY) {
+            self.objects.insert(AESKEY, SecureObject::AESKey { key: (0x40..=0x4F).collect() });
+            self.metadata.insert(AESKEY, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
+        }
+        if !self.objects.contains_key(&ECKEY) {
+            self.objects.insert(ECKEY, SecureObject::ECPublicKey {
+                curve: crate::object_store::types::ECCurve::NistP256,
+                public_key: hex::decode(ECKEY_PUB).unwrap_or_default(),
+            });
+            self.metadata.insert(ECKEY, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
+        }
         self.persist();
+    }
+
+    /// The SE's own key pairs (ECKey session key agreement, attestation),
+    /// created on first use and persisted.
+    pub fn ensure_eckey_session_key(&mut self) {
+        let mut changed = false;
+        for id in [RESERVED_ID_ECKEY_SESSION, RESERVED_ID_ATTESTATION_KEY] {
+            if self.objects.contains_key(&id) {
+                continue;
+            }
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+            let pk = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
+            self.objects.insert(id, SecureObject::ECKeyPair {
+                curve: crate::object_store::types::ECCurve::NistP256,
+                private_key: sk.to_bytes().to_vec(),
+                public_key: pk,
+            });
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
     }
 
     pub fn metadata(&self, id: &[u8; 4]) -> Option<&ObjectMetadata> {

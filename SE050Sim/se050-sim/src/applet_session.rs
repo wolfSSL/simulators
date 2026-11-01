@@ -20,7 +20,18 @@
  */
 
 //! Applet sessions (AN12543 3.6.2, 4.5.1): CreateSession, ProcessSessionCmd
-//! and CloseSession, with ECKey authentication (AN12543 3.6.3.3, 4.5.4.1).
+//! and CloseSession, with the three kinds of Authentication Object:
+//!
+//! * UserID (3.6.3.1, 4.5.2.1): VerifySessionUserID compares the value; the
+//!   session then runs without secure messaging.
+//! * AESKey (3.6.3.2, 4.5.3): an SCP03 handshake (INITIALIZE UPDATE with
+//!   KVN 0, EXTERNAL AUTHENTICATE) with the object's AES-128 key as the static
+//!   ENC/MAC/DEK keys; the session is then SCP03-wrapped.
+//! * ECKey (3.6.3.3, 4.5.4.1), described below.
+//!
+//! In every kind a failed authentication counts as a failed attempt of the
+//! Authentication Object, and once the maximum is reached it no longer
+//! authenticates.
 //!
 //! An ECKey session is opened against an Authentication Object holding a NIST
 //! P-256 public key. The host proves possession of the private key with
@@ -52,7 +63,11 @@ use crate::tlv::{self, Tlv, TAG_1, TAG_SESSION_ID};
 
 pub const P2_SESSION_CREATE: u8 = 0x1B;
 pub const P2_SESSION_CLOSE: u8 = 0x1C;
+pub const P2_SESSION_USERID: u8 = 0x2C;
+const INS_INITIALIZE_UPDATE: u8 = 0x50;
+const INS_EXTERNAL_AUTHENTICATE: u8 = 0x82;
 const INS_AUTH_OBJECT: u8 = 0x40;
+const INS_ATTEST: u8 = 0x20;
 const INS_INTERNAL_AUTHENTICATE: u8 = 0x88;
 const DDC_INITIAL_MCV: u8 = 0x08;
 
@@ -69,16 +84,35 @@ pub fn trace(context: &str, apdu: &ParsedApdu, sw: u16) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    UserId,
+    AesKey,
+    EcKey,
+}
+
+enum State {
+    /// Created, not authenticated yet.
+    Created,
+    /// AESKey: INITIALIZE UPDATE answered, waiting for EXTERNAL AUTHENTICATE.
+    AesPending(crate::scp03::Scp03State),
+    /// Authenticated UserID session: commands travel plain.
+    Plain,
+    /// Authenticated AESKey / ECKey session: commands are SCP03-wrapped.
+    Scp(ScpSession),
+}
+
 struct AppletSession {
     auth_id: [u8; 4],
-    /// None until ECKeySessionInternalAuthenticate succeeds.
-    scp: Option<ScpSession>,
+    kind: Kind,
+    state: State,
 }
 
 /// Per-connection applet sessions. Reset by SELECT.
 #[derive(Default)]
 pub struct AppletSessions {
     sessions: HashMap<[u8; 8], AppletSession>,
+    demo_checked: bool,
 }
 
 impl AppletSessions {
@@ -91,6 +125,12 @@ impl AppletSessions {
     /// dispatches in the default session.
     pub fn intercept(&mut self, apdu: &ParsedApdu, store: &mut ObjectStore, scp_active: bool) -> Option<ApduResponse> {
         store.set_session_owner([0; 4]);
+        if !self.demo_checked {
+            self.demo_checked = true;
+            if std::env::var("SE050_SIM_DEMO_AUTH").map(|v| v == "1").unwrap_or(false) {
+                store.ensure_demo_auth_objects();
+            }
+        }
         if apdu.cla != 0x80 && apdu.cla != 0x84 {
             return None;
         }
@@ -109,6 +149,9 @@ impl AppletSessions {
         }
         if base_ins == INS_READ {
             store.ensure_eckey_session_key();
+            if apdu.ins & INS_ATTEST != 0 {
+                return Some(read_attested(apdu, store));
+            }
         }
         None
     }
@@ -117,18 +160,19 @@ impl AppletSessions {
         let Some(auth_id) = object_id(apdu) else {
             return ApduResponse::error(SW_WRONG_DATA);
         };
-        // Only ECKey Authentication Objects (NIST P-256) are supported.
-        let is_eckey = matches!(
-            store.get(&auth_id),
+        let kind = match store.get(&auth_id) {
+            Some(SecureObject::UserID { .. }) => Kind::UserId,
+            Some(SecureObject::AESKey { key }) if key.len() == 16 => Kind::AesKey,
             Some(SecureObject::ECPublicKey { curve: ECCurve::NistP256, .. })
-                | Some(SecureObject::ECKeyPair { curve: ECCurve::NistP256, .. })
-        );
-        if store.auth_state(&auth_id).is_none() || !is_eckey {
+            | Some(SecureObject::ECKeyPair { curve: ECCurve::NistP256, .. }) => Kind::EcKey,
+            _ => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        if store.auth_state(&auth_id).is_none() {
             return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
         }
         let mut id = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut id);
-        self.sessions.insert(id, AppletSession { auth_id, scp: None });
+        self.sessions.insert(id, AppletSession { auth_id, kind, state: State::Created });
         ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &id)])
     }
 
@@ -150,38 +194,101 @@ impl AppletSessions {
             return ApduResponse::error(SW_WRONG_DATA);
         }
 
-        let Some(scp) = session.scp.as_mut() else {
-            // Not authenticated yet: only the authentication (or closing).
-            let Ok(cmd) = ParsedApdu::parse(&raw) else {
-                return ApduResponse::error(SW_WRONG_DATA);
-            };
-            if cmd.ins == INS_INTERNAL_AUTHENTICATE {
-                let auth_id = session.auth_id;
-                let result = internal_authenticate(&cmd, auth_id, store);
-                trace("eckauth", &cmd, result.as_ref().map(|_| SW_NO_ERROR).unwrap_or_else(|e| *e));
-                return match result {
-                    Ok((resp, scp)) => {
-                        session.scp = Some(scp);
+        let auth_id = session.auth_id;
+        match std::mem::replace(&mut session.state, State::Created) {
+            State::Created => {
+                let Ok(cmd) = ParsedApdu::parse(&raw) else {
+                    return ApduResponse::error(SW_WRONG_DATA);
+                };
+                if cmd.base_ins() == INS_MGMT && cmd.p2 == P2_SESSION_CLOSE {
+                    self.sessions.remove(&sid);
+                    return ApduResponse::success();
+                }
+                let kind = session.kind;
+                let (result, ctx) = match kind {
+                    Kind::EcKey if cmd.ins == INS_INTERNAL_AUTHENTICATE => {
+                        let r = internal_authenticate(&cmd, auth_id, store);
+                        trace("eckauth", &cmd, r.as_ref().map(|_| SW_NO_ERROR).unwrap_or_else(|e| *e));
+                        (r.map(|(resp, scp)| (resp, State::Scp(scp))), "eckauth")
+                    }
+                    Kind::UserId if cmd.base_ins() == INS_MGMT && cmd.p2 == P2_SESSION_USERID => {
+                        (verify_user_id(&cmd, auth_id, store).map(|resp| (resp, State::Plain)), "userid")
+                    }
+                    Kind::AesKey if cmd.cla == 0x80 && cmd.ins == INS_INITIALIZE_UPDATE => {
+                        (initialize_update(&cmd, auth_id, store), "initupd")
+                    }
+                    _ => (Err(SW_CONDITIONS_NOT_SATISFIED), "auth"),
+                };
+                if ctx != "eckauth" {
+                    trace(ctx, &cmd, result.as_ref().map(|r| r.0.sw).unwrap_or_else(|e| *e));
+                }
+                match result {
+                    Ok((resp, state)) => {
+                        if let Some(s) = self.sessions.get_mut(&sid) {
+                            s.state = state;
+                        }
                         resp
                     }
                     Err(sw) => {
                         self.sessions.remove(&sid);
                         ApduResponse::error(sw)
                     }
+                }
+            }
+            State::AesPending(mut pending) => {
+                // EXTERNAL AUTHENTICATE completes the AESKey handshake.
+                if raw.len() < 4 || raw[0] != 0x84 || raw[1] != INS_EXTERNAL_AUTHENTICATE {
+                    self.sessions.remove(&sid);
+                    return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+                }
+                let resp = pending.external_authenticate(&raw);
+                if std::env::var("SE050_SIM_TRACE").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!("[trace] extauth  84 82 {:02x} {:02x} -> {:04x}", raw[2], raw[3], resp.sw);
+                }
+                match pending.into_session() {
+                    Some(scp) if resp.sw == SW_NO_ERROR => {
+                        store.auth_succeeded(&auth_id);
+                        if let Some(s) = self.sessions.get_mut(&sid) {
+                            s.state = State::Scp(scp);
+                        }
+                        resp
+                    }
+                    _ => {
+                        store.auth_failed(&auth_id);
+                        self.sessions.remove(&sid);
+                        ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED)
+                    }
+                }
+            }
+            State::Plain => {
+                let Ok(cmd) = ParsedApdu::parse(&raw) else {
+                    return ApduResponse::error(SW_WRONG_DATA);
                 };
+                let closing = cmd.base_ins() == INS_MGMT && cmd.p2 == P2_SESSION_CLOSE;
+                let resp = if closing {
+                    ApduResponse::success()
+                } else {
+                    run_in_session(&cmd, auth_id, store, scp_active)
+                };
+                trace("session", &cmd, resp.sw);
+                if closing || !store.exists(&auth_id) {
+                    self.sessions.remove(&sid);
+                } else if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.state = State::Plain;
+                }
+                resp
             }
-            if cmd.base_ins() == INS_MGMT && cmd.p2 == P2_SESSION_CLOSE {
-                self.sessions.remove(&sid);
-                return ApduResponse::success();
-            }
-            return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
-        };
+            State::Scp(scp) => self.process_scp(sid, auth_id, scp, &raw, store, scp_active),
+        }
+    }
 
+    fn process_scp(&mut self, sid: [u8; 8], auth_id: [u8; 4], mut scp: ScpSession, raw: &[u8], store: &mut ObjectStore,
+                   scp_active: bool) -> ApduResponse {
         if raw[0] & 0x04 == 0 {
             self.sessions.remove(&sid);
             return ApduResponse::error(SW_SECURITY_STATUS);
         }
-        let cmd = match scp.unwrap_command(&raw) {
+        let cmd = match scp.unwrap_command(raw) {
             Ok(c) => c,
             Err(sw) => {
                 if std::env::var("SE050_SIM_TRACE").map(|v| v == "1").unwrap_or(false) {
@@ -197,23 +304,134 @@ impl AppletSessions {
         } else if cmd.base_ins() == INS_PROCESS || (cmd.base_ins() == INS_MGMT && cmd.p2 == P2_SESSION_CREATE) {
             ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED)
         } else {
-            store.set_session_owner(session.auth_id);
-            if cmd.base_ins() == INS_READ {
-                store.ensure_eckey_session_key();
-            }
-            let r = crate::dispatch::dispatch(&cmd, store, scp_active);
-            store.set_session_owner([0; 4]);
-            r
+            run_in_session(&cmd, auth_id, store, scp_active)
         };
         trace("session", &cmd, resp.sw);
         let wrapped = scp.wrap_response(resp);
         // The session also ends when its own Authentication Object is gone
         // (deleted from within the session, AN12543 3.6.4).
-        if closing || !store.exists(&session.auth_id) {
+        if closing || !store.exists(&auth_id) {
             self.sessions.remove(&sid);
+        } else if let Some(s) = self.sessions.get_mut(&sid) {
+            s.state = State::Scp(scp);
         }
         wrapped
     }
+}
+
+/// ReadObject with attestation (applet 7.x layout, as read by Plug & Trust's
+/// Se05x_API_ReadObject_W_Attst_V2): TAG_1 object ID, TAG_5 attestation key
+/// ID, TAG_6 algorithm, TAG_7 random. Response: TAG_1 value (public key for
+/// EC keys), TAG_2 chip ID, TAG_3 attributes, TAG_4 object size, TAG_TIMESTAMP,
+/// TAG_SIGNATURE. The signature is ECDSA-SHA256 by the attestation key over
+/// SHA-256(command) || the response TLVs with 3-byte lengths, as the host
+/// rebuilds them (nxECKey_VerifyAttestation). Only EC objects and only the
+/// SE's attestation key (ECDSA-SHA256) are supported.
+fn read_attested(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+    let Ok(tlvs) = apdu.parse_tlvs() else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    let id: Option<[u8; 4]> = tlv::find_tlv(&tlvs, TAG_1).and_then(|t| t.value.as_slice().try_into().ok());
+    let att: Option<[u8; 4]> = tlv::find_tlv(&tlvs, crate::tlv::TAG_5).and_then(|t| t.value.as_slice().try_into().ok());
+    let (Some(id), Some(att)) = (id, att) else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    if att != crate::object_store::RESERVED_ID_ATTESTATION_KEY || !store.policy_allows(&id, crate::policy::POLICY_OBJ_ALLOW_READ) {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let (value, size) = match store.get(&id) {
+        Some(SecureObject::ECKeyPair { curve, public_key, .. }) | Some(SecureObject::ECPublicKey { curve, public_key }) => {
+            (public_key.clone(), curve.scalar_len() as u16)
+        }
+        _ => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+    };
+    let Some(attributes) = crate::handlers::object_mgmt::object_attributes(store, &id) else {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let att_priv = match store.get(&att) {
+        Some(SecureObject::ECKeyPair { private_key, .. }) => private_key.clone(),
+        _ => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+    };
+    let chip_id = *b"SE050SIM-CHIP-0001";
+    static TS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut timestamp = [0u8; 12];
+    timestamp[8..].copy_from_slice(&TS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_be_bytes());
+    let size = size.to_be_bytes();
+
+    // The command as the host hashes it: header, 00 00 Lc (Lc < 256), data.
+    let mut cmd = vec![apdu.cla & !0x04, apdu.ins, apdu.p1, apdu.p2, 0x00, 0x00, apdu.data.len() as u8];
+    cmd.extend_from_slice(&apdu.data);
+    let mut signed = Sha256::digest(&cmd).to_vec();
+    for (tag, v) in [
+        (TAG_1, &value[..]),
+        (crate::tlv::TAG_2, &chip_id[..]),
+        (crate::tlv::TAG_3, &attributes[..]),
+        (crate::tlv::TAG_4, &size[..]),
+        (0x4F, &timestamp[..]),
+    ] {
+        signed.extend_from_slice(&[tag, 0x82, (v.len() >> 8) as u8, v.len() as u8]);
+        signed.extend_from_slice(v);
+    }
+    use p256::ecdsa::signature::Signer;
+    let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&att_priv) else {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let sig: p256::ecdsa::Signature = sk.sign(&signed);
+    ApduResponse::success_with_tlvs(&[
+        Tlv::new(TAG_1, &value),
+        Tlv::new(crate::tlv::TAG_2, &chip_id),
+        Tlv::new(crate::tlv::TAG_3, &attributes),
+        Tlv::new(crate::tlv::TAG_4, &size),
+        Tlv::new(0x4F, &timestamp),
+        Tlv::new(0x52, sig.to_der().as_bytes()),
+    ])
+}
+
+/// Dispatches a command of an authenticated session, with the session's
+/// Authentication Object as the policy owner.
+fn run_in_session(cmd: &ParsedApdu, auth_id: [u8; 4], store: &mut ObjectStore, scp_active: bool) -> ApduResponse {
+    store.set_session_owner(auth_id);
+    if cmd.base_ins() == INS_READ {
+        store.ensure_eckey_session_key();
+    }
+    let r = crate::dispatch::dispatch(cmd, store, scp_active);
+    store.set_session_owner([0; 4]);
+    r
+}
+
+/// VerifySessionUserID: TLV[TAG_1] = the UserID value.
+fn verify_user_id(cmd: &ParsedApdu, auth_id: [u8; 4], store: &mut ObjectStore) -> Result<ApduResponse, u16> {
+    if store.auth_blocked(&auth_id) {
+        return Err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let tlvs = cmd.parse_tlvs().map_err(|_| SW_WRONG_DATA)?;
+    let given = tlv::find_tlv(&tlvs, TAG_1).ok_or(SW_WRONG_DATA)?;
+    let ok = matches!(store.get(&auth_id), Some(SecureObject::UserID { value }) if *value == given.value);
+    if !ok {
+        store.auth_failed(&auth_id);
+        return Err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    store.auth_succeeded(&auth_id);
+    Ok(ApduResponse::success())
+}
+
+/// AESKey session, INITIALIZE UPDATE: the object's key is the static ENC, MAC
+/// and DEK key; the key version is 0 (AN12543 4.5.3.1).
+fn initialize_update(cmd: &ParsedApdu, auth_id: [u8; 4], store: &mut ObjectStore) -> Result<(ApduResponse, State), u16> {
+    if store.auth_blocked(&auth_id) {
+        return Err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let key = match store.get(&auth_id) {
+        Some(SecureObject::AESKey { key }) if key.len() == 16 => key.clone(),
+        _ => return Err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+    let cfg = crate::scp03::keys::Scp03Config { kvn: 0x00, enc: key.clone(), mac: key.clone(), dek: key };
+    let mut st = crate::scp03::Scp03State::new();
+    let resp = st.initialize_update_with_config(cmd.p1, &cmd.data, crate::applet::AppletVersion::from_env(), cfg);
+    if resp.sw != SW_NO_ERROR {
+        return Err(resp.sw);
+    }
+    Ok((resp, State::AesPending(st)))
 }
 
 fn object_id(apdu: &ParsedApdu) -> Option<[u8; 4]> {
@@ -569,5 +787,96 @@ mod tests {
         assert_ne!(r.sw, SW_NO_ERROR);
         let r = run(&mut s, &mut store, &cmd(0x80, INS_MGMT, 0, P2_DELETE_OBJECT, &tlv(TAG_1, &HMAC_ID)));
         assert_eq!(r.sw, SW_NO_ERROR);
+    }
+
+    fn demo_store() -> (ObjectStore, AppletSessions) {
+        let mut store = ObjectStore::new();
+        store.ensure_demo_auth_objects();
+        (store, AppletSessions::default())
+    }
+
+    fn create_for(s: &mut AppletSessions, store: &mut ObjectStore, id: [u8; 4]) -> [u8; 8] {
+        let r = run(s, store, &cmd(0x80, INS_MGMT, 0x00, P2_SESSION_CREATE, &tlv(TAG_1, &id)));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        let t = crate::tlv::parse_tlvs(&r.data).unwrap();
+        tlv::find_tlv(&t, TAG_1).unwrap().value.as_slice().try_into().unwrap()
+    }
+
+    #[test]
+    fn userid_session_plain_commands_and_counter() {
+        let (mut store, mut s) = demo_store();
+        const UID: [u8; 4] = [0x7D, 0xA0, 0x00, 0x01];
+        // a UserID with a maximum, created over the (assumed) authenticated channel
+        let mut d = tlv(crate::tlv::TAG_MAX_ATTEMPTS, &[0, 2]);
+        d.extend(tlv(TAG_1, &[0x7D, 0xA0, 0x00, 0x10]));
+        d.extend(tlv(crate::tlv::TAG_2, b"abcd"));
+        assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE | 0x40, P1_USERID, 0, &d)).sw, SW_NO_ERROR);
+        // not updatable
+        assert_ne!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE | 0x40, P1_USERID, 0, &d)).sw, SW_NO_ERROR);
+
+        let sid = create_for(&mut s, &mut store, UID);
+        let wrong = cmd(0x80, INS_MGMT, 0, P2_SESSION_USERID, &tlv(TAG_1, &[0xC0, 1, 2, 3, 5]));
+        assert_eq!(process(&mut s, &mut store, &sid, &wrong).sw, SW_CONDITIONS_NOT_SATISFIED);
+        let sid = create_for(&mut s, &mut store, UID);
+        let right = cmd(0x80, INS_MGMT, 0, P2_SESSION_USERID, &tlv(TAG_1, &[0xC0, 1, 2, 3, 4]));
+        assert_eq!(process(&mut s, &mut store, &sid, &right).sw, SW_NO_ERROR);
+        // plain command inside the session: GetVersion
+        let r = process(&mut s, &mut store, &sid, &[0x80, 0x04, 0x00, 0x20]);
+        assert_eq!(r.sw, SW_NO_ERROR);
+        assert!(!r.data.is_empty());
+        assert_eq!(process(&mut s, &mut store, &sid, &[0x80, 0x04, 0x00, P2_SESSION_CLOSE]).sw, SW_NO_ERROR);
+
+        // the limited UserID blocks after 2 wrong values; attempts are not reported
+        const U2: [u8; 4] = [0x7D, 0xA0, 0x00, 0x10];
+        for _ in 0..2 {
+            let sid = create_for(&mut s, &mut store, U2);
+            let bad = cmd(0x80, INS_MGMT, 0, P2_SESSION_USERID, &tlv(TAG_1, b"abce"));
+            assert_eq!(process(&mut s, &mut store, &sid, &bad).sw, SW_CONDITIONS_NOT_SATISFIED);
+        }
+        let sid = create_for(&mut s, &mut store, U2);
+        let good = cmd(0x80, INS_MGMT, 0, P2_SESSION_USERID, &tlv(TAG_1, b"abcd"));
+        assert_eq!(process(&mut s, &mut store, &sid, &good).sw, SW_CONDITIONS_NOT_SATISFIED);
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_READ, 0, P2_ATTRIBUTES, &tlv(TAG_1, &U2)));
+        let a = &crate::tlv::parse_tlvs(&r.data).unwrap()[0].value;
+        assert_eq!((a[5], &a[6..8], &a[12..14]), (0x02, &[0, 0][..], &[0, 2][..]));
+    }
+
+    #[test]
+    fn aeskey_session_handshake_and_wrapped_commands() {
+        let (mut store, mut s) = demo_store();
+        const AID_AES: [u8; 4] = [0x7D, 0xA0, 0x00, 0x02];
+        let key: Vec<u8> = (0x40..=0x4F).collect();
+
+        // wrong key: host cryptogram does not verify -> counted (max 0 = unlimited, so no block)
+        for (k, expect_ok) in [(vec![0u8; 16], false), (key.clone(), true)] {
+            let sid = create_for(&mut s, &mut store, AID_AES);
+            let host_ch = [7u8; 8];
+            let r = process(&mut s, &mut store, &sid, &cmd(0x80, INS_INITIALIZE_UPDATE, 0x00, 0x00, &host_ch));
+            assert_eq!(r.sw, SW_NO_ERROR);
+            assert_eq!(r.data.len(), 29);
+            let mut card_ch = [0u8; 8];
+            card_ch.copy_from_slice(&r.data[13..21]);
+            let (s_enc, s_mac, s_rmac) = crypto::derive_session_keys(&k, &k, &host_ch, &card_ch).unwrap();
+            let card_ok = crypto::cryptogram(&s_mac, &host_ch, &card_ch, crypto::DDC_CARD_CRYPTOGRAM).unwrap()[..] == r.data[21..29];
+            assert_eq!(card_ok, expect_ok);
+            let host_crypto = crypto::cryptogram(&s_mac, &host_ch, &card_ch, 0x01).unwrap();
+            let mut ea = vec![0x84, INS_EXTERNAL_AUTHENTICATE, 0x33, 0x00, 0x10];
+            ea.extend_from_slice(&host_crypto);
+            let mcv = crypto::cmac_chain(&s_mac, &[0u8; 16], &ea).unwrap();
+            ea.extend_from_slice(&mcv[..8]);
+            let r = process(&mut s, &mut store, &sid, &ea);
+            if !expect_ok {
+                assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+                assert_eq!(store.auth_state(&AID_AES).unwrap().attempts, 0); // unlimited: not counted
+                continue;
+            }
+            assert_eq!(r.sw, SW_NO_ERROR);
+            let mut host = Host { s_enc, s_mac, s_rmac, mcv, counter: 1 };
+            let (v, sw) = host.call(&mut s, &mut store, &sid, 0x80, 0x04, 0x00, 0x20, &[]);
+            assert_eq!(sw, SW_NO_ERROR);
+            assert!(!v.is_empty());
+            let (_, sw) = host.call(&mut s, &mut store, &sid, 0x80, INS_MGMT, 0, P2_SESSION_CLOSE, &[]);
+            assert_eq!(sw, SW_NO_ERROR);
+        }
     }
 }

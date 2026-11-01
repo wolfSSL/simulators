@@ -16,7 +16,8 @@ fi
 
 # Platform SCP03 variant: provision the simulator and the SDK from the same
 # key file so the two sides cannot drift.
-if [ "$SE05X_AUTH" = "PlatfSCP03" ]; then
+case "$SE05X_AUTH" in *PlatfSCP03) PLATFSCP=1 ;; *) PLATFSCP=0 ;; esac
+if [ "$PLATFSCP" = 1 ]; then
     echo "=== Platform SCP03 variant: provisioning keys from $KEYFILE ==="
     export SE050_SIM_SCP03_ENC=$(awk '/^ENC /{print $2}' "$KEYFILE")
     export SE050_SIM_SCP03_MAC=$(awk '/^MAC /{print $2}' "$KEYFILE")
@@ -24,6 +25,15 @@ if [ "$SE05X_AUTH" = "PlatfSCP03" ]; then
     echo "  simulator ENC=$SE050_SIM_SCP03_ENC"
     echo "  simulator MAC=$SE050_SIM_SCP03_MAC"
 fi
+
+# Applet session variants: the SDK opens a UserID / AESKey / ECKey session with
+# its demo Authentication Objects (ex_sss_auth.h); the simulator provisions them.
+case "$SE05X_AUTH" in
+    UserID*|AESKey*|ECKey*)
+        echo "=== Applet session variant ($SE05X_AUTH): demo Authentication Objects ==="
+        export SE050_SIM_DEMO_AUTH=1
+        ;;
+esac
 
 start_sim() {
     /app/se050-sim-server &

@@ -164,6 +164,7 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore, scp_active: bool) ->
             }
 
             // Digest oneshot
+            (P1_DEFAULT, handlers::kdf::P2_HKDF) => handlers::kdf::handle_hkdf(apdu, store),
             (P1_DEFAULT, P2_ONESHOT) => handlers::digest::handle_digest_oneshot(apdu, store),
 
             // Digest multi-step

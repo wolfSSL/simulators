@@ -237,6 +237,8 @@ impl T1Responder {
                 self.scp03.reset();
                 self.selected_ssd = false;
                 self.applet_sessions.reset();
+                // Nothing is pending on a fresh link.
+                self.last_response.clear();
 
                 let ft = FrameType::SFrame {
                     code: T1_S_INTERFACE_SOFT_RESET,
@@ -253,6 +255,8 @@ impl T1Responder {
                 self.scp03.reset();
                 self.selected_ssd = false;
                 self.applet_sessions.reset();
+                // Nothing is pending on a fresh link.
+                self.last_response.clear();
 
                 let ft = FrameType::SFrame { code: 0x00, is_response: true };
                 let (header, payload_crc) = build_frame(self.nad_se2hd, ft, &[]);
@@ -542,6 +546,22 @@ mod tests {
         // without error bits (chaining acknowledgement) nothing is sent
         let (h, p) = build_frame(0x5A, FrameType::RFrame { seq: 1, err: 0x00 }, &[]);
         assert!(t1.process_frame(&[h, p].concat(), &mut store).is_empty());
+    }
+
+    #[test]
+    fn test_reset_and_resync_forget_last_response() {
+        let select = [0x00, 0xA4, 0x04, 0x00, 0x10, 0xA0, 0x00, 0x00, 0x03, 0x96, 0x54, 0x53, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00];
+        for code in [T1_S_INTERFACE_SOFT_RESET, 0x00] {
+            let mut t1 = T1Responder::new(0x5A);
+            let mut store = ObjectStore::new();
+            let (h, p) = build_frame(0x5A, FrameType::IFrame { seq: 0, multi: false }, &select);
+            assert_eq!(t1.process_frame(&[h, p].concat(), &mut store).len(), 2);
+            let (h, p) = build_frame(0x5A, FrameType::SFrame { code, is_response: false }, &[]);
+            assert_eq!(t1.process_frame(&[h, p].concat(), &mut store).len(), 2);
+            // An error R-block after the reset has no previous response to replay.
+            let (h, p) = build_frame(0x5A, FrameType::RFrame { seq: 0, err: 0x01 }, &[]);
+            assert!(t1.process_frame(&[h, p].concat(), &mut store).is_empty(), "S-block {code:#04x}");
+        }
     }
 
     #[test]

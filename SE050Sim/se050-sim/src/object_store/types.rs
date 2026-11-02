@@ -45,6 +45,11 @@ pub struct ObjectMetadata {
 pub struct AuthState {
     pub max_attempts: u16,
     pub attempts: u16,
+    /// Random tag given when the object is created. A session remembers it,
+    /// so a session outlives neither its Authentication Object nor a new
+    /// object later created under the same ID.
+    #[serde(default)]
+    pub instance: u64,
 }
 
 impl Default for ObjectMetadata {

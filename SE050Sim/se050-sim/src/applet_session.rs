@@ -106,9 +106,13 @@ struct AppletSession {
     auth_id: [u8; 4],
     kind: Kind,
     state: State,
+    /// AuthState::instance of the Authentication Object when the session was
+    /// created; the session is void once the object is gone or replaced.
+    auth_instance: u64,
 }
 
-/// Per-connection applet sessions. Reset by SELECT.
+/// Per-connection applet sessions. Reset by SELECT and by a T=1 interface
+/// soft reset or resync, as a chip reset ends them.
 #[derive(Default)]
 pub struct AppletSessions {
     sessions: HashMap<[u8; 8], AppletSession>,
@@ -167,12 +171,12 @@ impl AppletSessions {
             | Some(SecureObject::ECKeyPair { curve: ECCurve::NistP256, .. }) => Kind::EcKey,
             _ => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
         };
-        if store.auth_state(&auth_id).is_none() {
+        let Some(auth) = store.auth_state(&auth_id) else {
             return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
-        }
+        };
         let mut id = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut id);
-        self.sessions.insert(id, AppletSession { auth_id, kind, state: State::Created });
+        self.sessions.insert(id, AppletSession { auth_id, kind, state: State::Created, auth_instance: auth.instance });
         ApduResponse::success_with_tlvs(&[Tlv::new(TAG_1, &id)])
     }
 
@@ -190,6 +194,12 @@ impl AppletSessions {
         let Some(session) = self.sessions.get_mut(&sid) else {
             return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
         };
+        // A session ends with its Authentication Object (AN12543 3.6.4),
+        // whoever deleted it; a new object under the same ID does not revive it.
+        if store.auth_state(&session.auth_id).map(|a| a.instance) != Some(session.auth_instance) {
+            self.sessions.remove(&sid);
+            return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+        }
         if raw.len() < 4 {
             return ApduResponse::error(SW_WRONG_DATA);
         }
@@ -878,5 +888,117 @@ mod tests {
             let (_, sw) = host.call(&mut s, &mut store, &sid, 0x80, INS_MGMT, 0, P2_SESSION_CLOSE, &[]);
             assert_eq!(sw, SW_NO_ERROR);
         }
+    }
+
+    fn ec_auth_write(id: &[u8; 4], curve: u8, max: Option<&[u8]>, pubkey: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        if let Some(m) = max {
+            data.extend(tlv(crate::tlv::TAG_MAX_ATTEMPTS, m));
+        }
+        data.extend(tlv(TAG_1, id));
+        data.extend(tlv(crate::tlv::TAG_2, &[curve]));
+        data.extend(tlv(crate::tlv::TAG_4, pubkey));
+        cmd(0x80, INS_WRITE | 0x40, P1_EC | P1_PUBLIC_KEY, 0x00, &data)
+    }
+
+    #[test]
+    fn reserved_session_key_is_read_only() {
+        let good = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let (mut store, mut s) = setup(&good);
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_READ, 0, 0, &tlv(TAG_1, &RESERVED_ID_ECKEY_SESSION)));
+        assert_eq!(r.sw, SW_NO_ERROR, "public key read");
+        let peer = p256::SecretKey::random(&mut rand::rngs::OsRng).public_key().to_encoded_point(false).as_bytes().to_vec();
+        let mut ecdh = tlv(TAG_1, &RESERVED_ID_ECKEY_SESSION);
+        ecdh.extend(tlv(crate::tlv::TAG_2, &peer));
+        let mut sign = tlv(TAG_1, &RESERVED_ID_ECKEY_SESSION);
+        sign.extend(tlv(crate::tlv::TAG_2, &[0x21]));
+        sign.extend(tlv(crate::tlv::TAG_3, &[0x11; 32]));
+        let mut ecdh_into = tlv(TAG_1, &HMAC_ID);
+        ecdh_into.extend(tlv(crate::tlv::TAG_2, &peer));
+        ecdh_into.extend(tlv(crate::tlv::TAG_7, &RESERVED_ID_ECKEY_SESSION));
+        for (what, raw) in [
+            ("ECDH", cmd(0x80, INS_CRYPTO, P1_EC, P2_DH, &ecdh)),
+            ("sign", cmd(0x80, INS_CRYPTO, P1_SIGNATURE, P2_SIGN, &sign)),
+            ("ECDH into", cmd(0x80, INS_CRYPTO, P1_EC, P2_DH, &ecdh_into)),
+            ("delete", cmd(0x80, INS_MGMT, 0, P2_DELETE_OBJECT, &tlv(TAG_1, &RESERVED_ID_ECKEY_SESSION))),
+            ("replace", ec_auth_write(&RESERVED_ID_ECKEY_SESSION, 0x03, None, &peer)),
+        ] {
+            assert_eq!(run(&mut s, &mut store, &raw).sw, SW_CONDITIONS_NOT_SATISFIED, "{what}");
+        }
+        // Nor inside an authenticated session.
+        let sid = create(&mut s, &mut store);
+        let mut host = authenticate(&mut s, &mut store, &sid, &good).unwrap();
+        let (_, sw) = host.call(&mut s, &mut store, &sid, 0x80, INS_CRYPTO, P1_EC, P2_DH, &ecdh);
+        assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(matches!(store.get(&RESERVED_ID_ECKEY_SESSION), Some(SecureObject::ECKeyPair { .. })));
+    }
+
+    #[test]
+    fn key_pair_authentication_object_does_not_sign_for_others() {
+        // A key-pair Authentication Object with no policy is read only
+        // (AN12543 table 17): it cannot sign the authentication challenge
+        // for a caller that lacks the private key.
+        let mut store = ObjectStore::new();
+        let mut s = AppletSessions::default();
+        let mut data = tlv(TAG_1, &AUTH_ID);
+        data.extend(tlv(crate::tlv::TAG_2, &[0x03]));
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_WRITE | 0x40, P1_EC | P1_KEY_PAIR, 0x00, &data));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        let mut sign = tlv(TAG_1, &AUTH_ID);
+        sign.extend(tlv(crate::tlv::TAG_2, &[0x21])); // ECDSA SHA-256
+        sign.extend(tlv(crate::tlv::TAG_3, &[0x11; 32]));
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_CRYPTO, P1_SIGNATURE, P2_SIGN, &sign));
+        assert_eq!(r.sw, SW_COMMAND_NOT_ALLOWED);
+        let peer = p256::SecretKey::random(&mut rand::rngs::OsRng).public_key().to_encoded_point(false).as_bytes().to_vec();
+        let mut ecdh = tlv(TAG_1, &AUTH_ID);
+        ecdh.extend(tlv(crate::tlv::TAG_2, &peer));
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_CRYPTO, P1_EC, P2_DH, &ecdh));
+        assert_eq!(r.sw, SW_COMMAND_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn sessions_end_when_their_authentication_object_is_deleted() {
+        let good = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let (mut store, mut s) = setup(&good);
+        let pubkey = good.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let sid_a = create(&mut s, &mut store);
+        let mut a = authenticate(&mut s, &mut store, &sid_a, &good).unwrap();
+        let sid_b = create(&mut s, &mut store);
+        let mut b = authenticate(&mut s, &mut store, &sid_b, &good).unwrap();
+        let sid_pending = create(&mut s, &mut store);
+        // Session B deletes the Authentication Object (its own policy allows
+        // it), then the object is created again under the same ID.
+        let (_, sw) = b.call(&mut s, &mut store, &sid_b, 0x80, INS_MGMT, 0, P2_DELETE_OBJECT, &tlv(TAG_1, &AUTH_ID));
+        assert_eq!(sw, SW_NO_ERROR);
+        let r = run(&mut s, &mut store, &ec_auth_write(&AUTH_ID, 0x03, None, &pubkey));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        // Neither session A nor the half-open one survive, though the ID exists again.
+        let (_, sw) = a.call(&mut s, &mut store, &sid_a, 0x80, INS_CRYPTO, P1_MAC, P2_GENERATE_ONESHOT, &hmac_cmd());
+        assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(authenticate(&mut s, &mut store, &sid_pending, &good).err(), Some(SW_CONDITIONS_NOT_SATISFIED));
+        assert_eq!(store.auth_state(&AUTH_ID).unwrap().attempts, 0, "a stale session costs no attempt");
+        // A new session on the new object works.
+        let sid = create(&mut s, &mut store);
+        assert!(authenticate(&mut s, &mut store, &sid, &good).is_ok());
+    }
+
+    #[test]
+    fn authentication_object_parameters_are_validated() {
+        let mut store = ObjectStore::new();
+        let mut s = AppletSessions::default();
+        let p256_pub = p256::SecretKey::random(&mut rand::rngs::OsRng).public_key().to_encoded_point(false).as_bytes().to_vec();
+        let p384_pub = p384::SecretKey::random(&mut rand::rngs::OsRng).public_key().to_encoded_point(false).as_bytes().to_vec();
+        for (what, raw) in [
+            ("max attempts, one byte", ec_auth_write(&AUTH_ID, 0x03, Some(&[0x03]), &p256_pub)),
+            ("max attempts, three bytes", ec_auth_write(&AUTH_ID, 0x03, Some(&[0, 0, 3]), &p256_pub)),
+            ("max attempts above 0x7FFF", ec_auth_write(&AUTH_ID, 0x03, Some(&[0x80, 0x00]), &p256_pub)),
+            ("P-384", ec_auth_write(&AUTH_ID, 0x04, None, &p384_pub)),
+        ] {
+            assert_eq!(run(&mut s, &mut store, &raw).sw, SW_WRONG_DATA, "{what}");
+            assert!(!store.exists(&AUTH_ID), "{what}: nothing stored");
+        }
+        let r = run(&mut s, &mut store, &ec_auth_write(&AUTH_ID, 0x03, Some(&[0x7F, 0xFF]), &p256_pub));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        assert_eq!(store.auth_state(&AUTH_ID).unwrap().max_attempts, 0x7FFF);
     }
 }

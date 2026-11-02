@@ -236,6 +236,7 @@ impl T1Responder {
                 self.apdu_reassembly.clear();
                 self.scp03.reset();
                 self.selected_ssd = false;
+                self.applet_sessions.reset();
 
                 let ft = FrameType::SFrame {
                     code: T1_S_INTERFACE_SOFT_RESET,
@@ -251,6 +252,7 @@ impl T1Responder {
                 self.apdu_reassembly.clear();
                 self.scp03.reset();
                 self.selected_ssd = false;
+                self.applet_sessions.reset();
 
                 let ft = FrameType::SFrame { code: 0x00, is_response: true };
                 let (header, payload_crc) = build_frame(self.nad_se2hd, ft, &[]);
@@ -474,6 +476,56 @@ impl T1Responder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends one APDU in an I-block (host sequence `seq`) and returns the
+    /// status word of the single-frame response.
+    fn apdu_sw(t1: &mut T1Responder, store: &mut ObjectStore, seq: u8, apdu: &[u8]) -> u16 {
+        let (h, p) = build_frame(0x5A, FrameType::IFrame { seq, multi: false }, apdu);
+        let out = t1.process_frame(&[h, p].concat(), store);
+        let payload = &out[1];
+        let body = &payload[..payload.len() - 2];
+        u16::from_be_bytes([body[body.len() - 2], body[body.len() - 1]])
+    }
+
+    #[test]
+    fn test_reset_and_resync_end_applet_sessions() {
+        use crate::object_store::types::{ECCurve, SecureObject};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let auth_id = [0x7D, 0xA0, 0x00, 0x01];
+        let pk = p256::SecretKey::random(&mut rand::rngs::OsRng).public_key();
+        // None = control (no reset), else the S-block request code.
+        for reset in [None, Some(T1_S_INTERFACE_SOFT_RESET), Some(0x00)] {
+            let mut store = ObjectStore::new();
+            store.insert(auth_id, SecureObject::ECPublicKey {
+                curve: ECCurve::NistP256,
+                public_key: pk.to_encoded_point(false).as_bytes().to_vec(),
+            });
+            store.set_creation_metadata(auth_id, None, 0x01);
+            store.set_auth_object(auth_id, 0);
+            let mut t1 = T1Responder::new(0x5A);
+            // CreateSession (plain): the response carries the session ID.
+            let mut create = vec![0x80, 0x04, 0x00, 0x1B, 0x06, 0x41, 0x04];
+            create.extend_from_slice(&auth_id);
+            let (h, p) = build_frame(0x5A, FrameType::IFrame { seq: 0, multi: false }, &create);
+            let out = t1.process_frame(&[h, p].concat(), &mut store);
+            let body = &out[1][..out[1].len() - 2];
+            assert_eq!(&body[body.len() - 2..], &[0x90, 0x00]);
+            let sid = body[2..10].to_vec();
+            let mut seq = 1;
+            if let Some(code) = reset {
+                let (h, p) = build_frame(0x5A, FrameType::SFrame { code, is_response: false }, &[]);
+                t1.process_frame(&[h, p].concat(), &mut store);
+                seq = 0;
+            }
+            // CloseSession for that session ID, inside ProcessSessionCmd.
+            let mut process = vec![0x80, 0x05, 0x00, 0x00, 0x10, 0x10, 0x08];
+            process.extend_from_slice(&sid);
+            process.extend_from_slice(&[0x41, 0x04, 0x80, 0x04, 0x00, 0x1C]);
+            let sw = apdu_sw(&mut t1, &mut store, seq, &process);
+            let expected = if reset.is_some() { 0x6985 } else { 0x9000 };
+            assert_eq!(sw, expected, "reset {reset:?}");
+        }
+    }
 
     #[test]
     fn test_r_block_with_error_repeats_last_response() {

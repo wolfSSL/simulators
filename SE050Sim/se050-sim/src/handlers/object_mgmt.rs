@@ -24,15 +24,49 @@ use crate::object_store::types::SecureObject;
 use crate::object_store::ObjectStore;
 use crate::tlv::{self, Tlv, TAG_1, TAG_2, TAG_3, TAG_4, TAG_POLICY};
 
+/// WriteUserID (AN12543 4.7.1.5): policy and maximum attempts (< 256) only on
+/// creation, TAG_1 object ID, TAG_2 value of 4 to 16 bytes. An existing UserID
+/// cannot be updated.
+fn handle_write_userid(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
+    let Ok(tlvs) = apdu.parse_tlvs() else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    let Some(obj_id) = extract_object_id(&tlvs) else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    let Some(value) = tlv::find_tlv(&tlvs, TAG_2).map(|t| t.value.clone()) else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    if !(4..=16).contains(&value.len()) {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+    if store.exists(&obj_id) {
+        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let Ok(max) = crate::tlv::max_attempts(&tlvs, 255) else {
+        return ApduResponse::error(SW_WRONG_DATA);
+    };
+    let policy = match crate::policy::creation_policy(&tlvs) {
+        Ok(p) => p,
+        Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+    };
+    store.insert(obj_id, SecureObject::UserID { value });
+    store.set_creation_metadata(obj_id, policy, 0x01);
+    store.set_auth_object(obj_id, max);
+    ApduResponse::success()
+}
+
 /// Handle WRITE commands for Binary, UserID, and Counter objects.
 pub fn handle_write(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     match apdu.cred_type() {
         P1_BINARY => handle_write_binary(apdu, store),
         // WriteUserID is refused in plain (unauthenticated) sessions:
         // bench-verified 0x6985 on SE050C applet 3.1.1 and SE051
-        // applet 7.2.0 alike, via both the raw APDU and the sss layer.
-        // The simulator only models plain sessions, so the write is
-        // always refused.
+        // applet 7.2.0 alike, via both the raw APDU and the sss layer
+        // (the transport refuses Authentication Object writes outside an
+        // authenticated channel, see applet_session::intercept). UserIDs
+        // exist only as Authentication Objects.
+        P1_USERID if apdu.ins & 0x40 != 0 => handle_write_userid(apdu, store),
         P1_USERID => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
         P1_COUNTER => handle_write_counter(apdu, store),
         _ => ApduResponse::error(SW_WRONG_P1P2),
@@ -433,17 +467,36 @@ fn handle_read_attributes(
         Some(id) => id,
         None => return ApduResponse::error(SW_WRONG_DATA),
     };
-    let Some(object) = store.get(&obj_id) else {
-        return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
-    };
+    match object_attributes(store, &obj_id) {
+        Some(attributes) => ApduResponse::success_with_tlvs(&[Tlv::new(TAG_3, &attributes)]),
+        None => ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
+    }
+}
+
+/// Attribute bytes of an object (AN12543 tables 3 and 4), for
+/// ReadObjectAttributes and attested reads.
+pub fn object_attributes(store: &ObjectStore, obj_id: &[u8; 4]) -> Option<Vec<u8>> {
+    let obj_id = *obj_id;
+    let object = store.get(&obj_id)?;
 
     let mut attributes = Vec::new();
     attributes.extend_from_slice(&obj_id);
     attributes.push(object.type_code(true));
-    attributes.push(0x01); // kSE05x_SetIndicator_NOT_SET
-    attributes.extend_from_slice(&[0x00, 0x00]); // minimum AEAD tag length
-    attributes.extend_from_slice(&[0x00; 4]); // owner: unauthenticated session
-    attributes.extend_from_slice(&[0x00, 0x00]); // RFU
+    if let Some(auth) = store.auth_state(&obj_id) {
+        // Authentication Object layout (AN12543 table 3): indicator SET,
+        // failed attempts, owner, maximum attempts.
+        attributes.push(0x02); // kSE05x_SetIndicator_SET
+        // UserID attempts are counted but not reported (AN12543 3.2.4.4).
+        let shown = if matches!(object, SecureObject::UserID { .. }) { 0 } else { auth.attempts };
+        attributes.extend_from_slice(&shown.to_be_bytes());
+        attributes.extend_from_slice(&[0x00; 4]);
+        attributes.extend_from_slice(&auth.max_attempts.to_be_bytes());
+    } else {
+        attributes.push(0x01); // kSE05x_SetIndicator_NOT_SET
+        attributes.extend_from_slice(&[0x00, 0x00]); // minimum AEAD tag length
+        attributes.extend_from_slice(&[0x00; 4]); // owner: unauthenticated session
+        attributes.extend_from_slice(&[0x00, 0x00]); // RFU
+    }
     if let Some(metadata) = store.metadata(&obj_id) {
         if let Some(policy) = &metadata.policy {
             attributes.extend_from_slice(policy);
@@ -453,8 +506,7 @@ fn handle_read_attributes(
         attributes.push(0x01); // legacy store: treat as externally created
     }
     attributes.extend_from_slice(&[0x00; 4]); // object version
-
-    ApduResponse::success_with_tlvs(&[Tlv::new(TAG_3, &attributes)])
+    Some(attributes)
 }
 
 fn handle_check_exists(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {

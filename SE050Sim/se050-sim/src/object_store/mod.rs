@@ -84,11 +84,155 @@ pub struct ObjectStore {
     /// defaults (or environment overrides). Factory reset deliberately does
     /// not restore these keys, matching the irrecoverable real-card behavior.
     platform_scp: Option<Scp03Config>,
+    /// Authentication Object ID of the session running the current command
+    /// (all zeros = the default session). Set by the transport for each
+    /// command; policies are evaluated for this owner. Not persisted.
+    session_owner: [u8; 4],
+}
+
+/// RESERVED_ID_ECKEY_SESSION (kSE05x_AppletResID_KP_ECKEY_USER): the SE's
+/// own NIST P-256 key pair used for ECKey session key agreement.
+pub const RESERVED_ID_ECKEY_SESSION: [u8; 4] = [0x7F, 0xFF, 0x02, 0x01];
+
+/// The SE's ECC attestation key pair (SSS_SE05X_RESID_ATTESTATION_KEY in Plug
+/// & Trust): signs attested reads; hosts read its public key from the SE.
+pub const RESERVED_ID_ATTESTATION_KEY: [u8; 4] = [0xF0, 0x00, 0x00, 0x12];
+
+/// Applet-reserved objects the simulator manages itself. Hosts may read them
+/// (public part, attributes, existence) but not create, replace, delete or
+/// use them in generic crypto commands; only the applet's own flows use the
+/// private keys.
+pub const RESERVED_IDS: &[[u8; 4]] = &[RESERVED_ID_ECKEY_SESSION, RESERVED_ID_ATTESTATION_KEY];
+
+pub fn is_reserved_id(id: &[u8]) -> bool {
+    RESERVED_IDS.iter().any(|r| r[..] == *id)
 }
 
 fn default_curves() -> HashMap<u8, u8> {
     // P-192, P-224, P-256, P-384, P-521 fully parameterized.
     (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
+}
+
+/// Writes the persisted store without holding up the APDU being processed:
+/// a background thread writes the latest snapshot of each store file. A
+/// synchronous write in the command path took up to a second on a busy disk,
+/// longer than hosts wait for an answer (NXP's T=1 stack then asks for a
+/// retransmission).
+///
+/// - Snapshots are coalesced per destination path, so several stores in one
+///   process never discard each other's updates.
+/// - `flush_store` waits until a path has no queued or in-flight write; it runs
+///   before a store file is loaded and when a persistent store is dropped, so
+///   reopening a store never reads stale state.
+/// - The file holds private keys and SCP03 keys: it is written to a temporary
+///   file created with mode 0600 (or the existing file's mode), then renamed.
+mod writer {
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct State {
+        pending: HashMap<PathBuf, String>,
+        in_flight: HashSet<PathBuf>,
+    }
+
+    struct Writer {
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+
+    static WRITER: OnceLock<&'static Writer> = OnceLock::new();
+
+    fn writer() -> &'static Writer {
+        WRITER.get_or_init(|| {
+            let w: &'static Writer = Box::leak(Box::new(Writer {
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            std::thread::spawn(move || run(w));
+            w
+        })
+    }
+
+    fn run(w: &'static Writer) {
+        loop {
+            let batch: Vec<(PathBuf, String)> = {
+                let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                while st.pending.is_empty() {
+                    st = w.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                let batch: Vec<_> = st.pending.drain().collect();
+                for (p, _) in &batch {
+                    st.in_flight.insert(p.clone());
+                }
+                batch
+            };
+            for (path, json) in &batch {
+                write_file(path, json);
+            }
+            let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (p, _) in &batch {
+                st.in_flight.remove(p);
+            }
+            w.cv.notify_all();
+        }
+    }
+
+    fn write_file(path: &Path, json: &str) {
+        use std::io::Write;
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        let _ = std::fs::remove_file(&tmp);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let Ok(mut f) = opts.open(&tmp) else { return };
+        // Keep the access restrictions of the file being replaced.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
+        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
+            drop(f);
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    pub fn write_store(path: &Path, json: String) {
+        let w = writer();
+        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending.insert(path.to_path_buf(), json);
+        w.cv.notify_all();
+    }
+
+    /// Blocks until `path` has no queued or in-flight write.
+    pub fn flush_store(path: &Path) {
+        let Some(w) = WRITER.get() else { return };
+        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending.contains_key(path) || st.in_flight.contains(path) {
+            st = w.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+use writer::{flush_store, write_store};
+
+/// A persistent store finishes writing its file before it goes away, so a
+/// store reopened on the same file (or an orderly shutdown) sees every update.
+impl Drop for ObjectStore {
+    fn drop(&mut self) {
+        if let Some(path) = &self.persist_path {
+            flush_store(path);
+        }
+    }
 }
 
 impl ObjectStore {
@@ -102,6 +246,7 @@ impl ObjectStore {
             crypto_object_types: HashMap::new(),
             scp_required: false,
             platform_scp: None,
+            session_owner: [0; 4],
         }
     }
 
@@ -115,6 +260,7 @@ impl ObjectStore {
             crypto_object_types: HashMap::new(),
             scp_required: false,
             platform_scp: None,
+            session_owner: [0; 4],
         };
         store.load();
         store
@@ -143,21 +289,124 @@ impl ObjectStore {
     ) {
         self.metadata
             .entry(id)
-            .or_insert(ObjectMetadata { policy, origin });
+            .or_insert(ObjectMetadata { policy, origin, auth: None });
         self.persist();
+    }
+
+    /// Mark a freshly created object as an Authentication Object.
+    pub fn set_auth_object(&mut self, id: [u8; 4], max_attempts: u16) {
+        if let Some(m) = self.metadata.get_mut(&id) {
+            let instance = rand::RngCore::next_u64(&mut rand::rngs::OsRng);
+            m.auth = Some(crate::object_store::types::AuthState { max_attempts, attempts: 0, instance });
+            self.persist();
+        }
+    }
+
+    pub fn auth_state(&self, id: &[u8; 4]) -> Option<crate::object_store::types::AuthState> {
+        self.metadata.get(id).and_then(|m| m.auth)
+    }
+
+    /// True when the Authentication Object has used up its attempts.
+    pub fn auth_blocked(&self, id: &[u8; 4]) -> bool {
+        matches!(self.auth_state(id), Some(a) if a.max_attempts != 0 && a.attempts >= a.max_attempts)
+    }
+
+    /// Count a failed authentication (only when a maximum is set).
+    pub fn auth_failed(&mut self, id: &[u8; 4]) {
+        if let Some(a) = self.metadata.get_mut(id).and_then(|m| m.auth.as_mut()) {
+            if a.max_attempts != 0 && a.attempts < a.max_attempts {
+                a.attempts += 1;
+                self.persist();
+            }
+        }
+    }
+
+    /// A successful authentication resets the counter.
+    pub fn auth_succeeded(&mut self, id: &[u8; 4]) {
+        if let Some(a) = self.metadata.get_mut(id).and_then(|m| m.auth.as_mut()) {
+            if a.attempts != 0 {
+                a.attempts = 0;
+                self.persist();
+            }
+        }
+    }
+
+    pub fn session_owner(&self) -> [u8; 4] {
+        self.session_owner
+    }
+
+    pub fn set_session_owner(&mut self, owner: [u8; 4]) {
+        self.session_owner = owner;
+    }
+
+    /// SE050_SIM_DEMO_AUTH=1: the demo Authentication Objects that NXP Plug &
+    /// Trust's examples use (sss/ex/inc/ex_sss_auth.h, ex_sss_objid.h), so its
+    /// UserID, AESKey and ECKey session modes can run against the simulator:
+    /// 0x7DA00001 UserID C0 01 02 03 04, 0x7DA00002 AESKey 40..4F, 0x7DA00003
+    /// ECKey with the public key of EX_SSS_AUTH_SE05X_KEY_HOST_ECDSA_KEY. No
+    /// policy, unlimited attempts. Created once, like trust provisioning.
+    pub fn ensure_demo_auth_objects(&mut self) {
+        const USERID: [u8; 4] = [0x7D, 0xA0, 0x00, 0x01];
+        const AESKEY: [u8; 4] = [0x7D, 0xA0, 0x00, 0x02];
+        const ECKEY: [u8; 4] = [0x7D, 0xA0, 0x00, 0x03];
+        const ECKEY_PUB: &str = "043c9e47edf051a3589f67302d22567c2e17229e8883338ec3b7d527f9ee71d0a81aae7fe21caa6677783aa88da6d6a8ad5ec53b10bc0b11094482f04d24b5bec4";
+        if !self.objects.contains_key(&USERID) {
+            self.objects.insert(USERID, SecureObject::UserID { value: vec![0xC0, 0x01, 0x02, 0x03, 0x04] });
+            self.metadata.insert(USERID, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
+        }
+        if !self.objects.contains_key(&AESKEY) {
+            self.objects.insert(AESKEY, SecureObject::AESKey { key: (0x40..=0x4F).collect() });
+            self.metadata.insert(AESKEY, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
+        }
+        if !self.objects.contains_key(&ECKEY) {
+            self.objects.insert(ECKEY, SecureObject::ECPublicKey {
+                curve: crate::object_store::types::ECCurve::NistP256,
+                public_key: hex::decode(ECKEY_PUB).unwrap_or_default(),
+            });
+            self.metadata.insert(ECKEY, ObjectMetadata { policy: None, origin: 0x03, auth: Some(Default::default()) });
+        }
+        self.persist();
+    }
+
+    /// The SE's own key pairs (ECKey session key agreement, attestation),
+    /// created on first use and persisted.
+    pub fn ensure_eckey_session_key(&mut self) {
+        let mut changed = false;
+        for id in [RESERVED_ID_ECKEY_SESSION, RESERVED_ID_ATTESTATION_KEY] {
+            if self.objects.contains_key(&id) {
+                continue;
+            }
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+            let pk = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
+            self.objects.insert(id, SecureObject::ECKeyPair {
+                curve: crate::object_store::types::ECCurve::NistP256,
+                private_key: sk.to_bytes().to_vec(),
+                public_key: pk,
+            });
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
     }
 
     pub fn metadata(&self, id: &[u8; 4]) -> Option<&ObjectMetadata> {
         self.metadata.get(id)
     }
 
-    /// No attached policy means the applet default allows the operation.
-    /// Once a policy is attached, an omitted permission is a denial.
+    /// No attached policy means the applet default: everything for ordinary
+    /// objects, read only for Authentication Objects (AN12543 table 17).
+    /// Once a policy is attached, only the access rule of the current session
+    /// owner applies (rules are not inherited across owners, AN12543 3.7.1.2);
+    /// an owner without a rule, or an omitted permission, is a denial.
     pub fn policy_allows(&self, id: &[u8; 4], permission: u32) -> bool {
-        match self.metadata.get(id).and_then(|m| m.policy.as_deref()) {
-            Some(raw) => crate::policy::ar_header_union(raw)
+        let meta = self.metadata.get(id);
+        match meta.and_then(|m| m.policy.as_deref()) {
+            Some(raw) => crate::policy::ar_header_for(raw, &self.session_owner)
                 .map(|header| header & permission != 0)
                 .unwrap_or(false),
+            None if meta.and_then(|m| m.auth).is_some() => permission == crate::policy::POLICY_OBJ_ALLOW_READ,
             None => true,
         }
     }
@@ -287,12 +536,13 @@ impl ObjectStore {
             "platform_scp": self.platform_scp,
         });
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
-            let _ = std::fs::write(path, json);
+            write_store(path, json);
         }
     }
 
     fn load(&mut self) {
         let Some(path) = &self.persist_path else { return };
+        flush_store(path);
         let Ok(json) = std::fs::read_to_string(path) else { return };
         let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(&json) else {
             return;
@@ -465,6 +715,60 @@ mod persistence_tests {
         assert_eq!(loaded.enc, config.enc);
         assert_eq!(loaded.mac, config.mac);
         assert_eq!(loaded.dek, config.dek);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_stores_on_different_paths_keep_their_latest_snapshot() {
+        let a = unique_store_path("writer_path_a");
+        let b = unique_store_path("writer_path_b");
+        {
+            let mut sa = ObjectStore::with_persistence(a.clone());
+            let mut sb = ObjectStore::with_persistence(b.clone());
+            for i in 0..50u8 {
+                sa.insert([0, 0, 0xA0, i], SecureObject::Binary { data: vec![i] });
+                sb.insert([0, 0, 0xB0, i], SecureObject::Binary { data: vec![i] });
+            }
+        }
+        let sa = ObjectStore::with_persistence(a.clone());
+        let sb = ObjectStore::with_persistence(b.clone());
+        for i in 0..50u8 {
+            assert!(sa.exists(&[0, 0, 0xA0, i]) && !sa.exists(&[0, 0, 0xB0, i]));
+            assert!(sb.exists(&[0, 0, 0xB0, i]) && !sb.exists(&[0, 0, 0xA0, i]));
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn test_reopen_sees_updates_of_a_store_still_open() {
+        let path = unique_store_path("writer_reopen");
+        let mut first = ObjectStore::with_persistence(path.clone());
+        first.set_scp_required(true);
+        let second = ObjectStore::with_persistence(path.clone());
+        assert!(second.scp_required());
+        drop(first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_file_is_private_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_store_path("writer_mode");
+        let mode = |p: &PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.insert([0, 0, 0, 1], SecureObject::Binary { data: vec![1] });
+        }
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.insert([0, 0, 0, 2], SecureObject::Binary { data: vec![2] });
+        }
+        assert_eq!(mode(&path), 0o640);
+        assert!(ObjectStore::with_persistence(path.clone()).exists(&[0, 0, 0, 2]));
         let _ = std::fs::remove_file(&path);
     }
 }

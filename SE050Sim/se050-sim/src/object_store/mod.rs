@@ -84,6 +84,24 @@ pub struct ObjectStore {
     /// defaults (or environment overrides). Factory reset deliberately does
     /// not restore these keys, matching the irrecoverable real-card behavior.
     platform_scp: Option<Scp03Config>,
+    /// Authentication Object ID of the session running the current command
+    /// (all zeros = the default session). Set by the transport for each
+    /// command; policies are evaluated for this owner. Not persisted.
+    session_owner: [u8; 4],
+}
+
+/// RESERVED_ID_ECKEY_SESSION (kSE05x_AppletResID_KP_ECKEY_USER): the SE's
+/// own NIST P-256 key pair used for ECKey session key agreement.
+pub const RESERVED_ID_ECKEY_SESSION: [u8; 4] = [0x7F, 0xFF, 0x02, 0x01];
+
+/// Applet-reserved objects the simulator manages itself. Hosts may read them
+/// (public part, attributes, existence) but not create, replace, delete or
+/// use them in generic crypto commands; only the applet's own flows use the
+/// private keys.
+pub const RESERVED_IDS: &[[u8; 4]] = &[RESERVED_ID_ECKEY_SESSION];
+
+pub fn is_reserved_id(id: &[u8]) -> bool {
+    RESERVED_IDS.iter().any(|r| r[..] == *id)
 }
 
 fn default_curves() -> HashMap<u8, u8> {
@@ -102,6 +120,7 @@ impl ObjectStore {
             crypto_object_types: HashMap::new(),
             scp_required: false,
             platform_scp: None,
+            session_owner: [0; 4],
         }
     }
 
@@ -115,6 +134,7 @@ impl ObjectStore {
             crypto_object_types: HashMap::new(),
             scp_required: false,
             platform_scp: None,
+            session_owner: [0; 4],
         };
         store.load();
         store
@@ -143,7 +163,69 @@ impl ObjectStore {
     ) {
         self.metadata
             .entry(id)
-            .or_insert(ObjectMetadata { policy, origin });
+            .or_insert(ObjectMetadata { policy, origin, auth: None });
+        self.persist();
+    }
+
+    /// Mark a freshly created object as an Authentication Object.
+    pub fn set_auth_object(&mut self, id: [u8; 4], max_attempts: u16) {
+        if let Some(m) = self.metadata.get_mut(&id) {
+            let instance = rand::RngCore::next_u64(&mut rand::rngs::OsRng);
+            m.auth = Some(crate::object_store::types::AuthState { max_attempts, attempts: 0, instance });
+            self.persist();
+        }
+    }
+
+    pub fn auth_state(&self, id: &[u8; 4]) -> Option<crate::object_store::types::AuthState> {
+        self.metadata.get(id).and_then(|m| m.auth)
+    }
+
+    /// True when the Authentication Object has used up its attempts.
+    pub fn auth_blocked(&self, id: &[u8; 4]) -> bool {
+        matches!(self.auth_state(id), Some(a) if a.max_attempts != 0 && a.attempts >= a.max_attempts)
+    }
+
+    /// Count a failed authentication (only when a maximum is set).
+    pub fn auth_failed(&mut self, id: &[u8; 4]) {
+        if let Some(a) = self.metadata.get_mut(id).and_then(|m| m.auth.as_mut()) {
+            if a.max_attempts != 0 && a.attempts < a.max_attempts {
+                a.attempts += 1;
+                self.persist();
+            }
+        }
+    }
+
+    /// A successful authentication resets the counter.
+    pub fn auth_succeeded(&mut self, id: &[u8; 4]) {
+        if let Some(a) = self.metadata.get_mut(id).and_then(|m| m.auth.as_mut()) {
+            if a.attempts != 0 {
+                a.attempts = 0;
+                self.persist();
+            }
+        }
+    }
+
+    pub fn session_owner(&self) -> [u8; 4] {
+        self.session_owner
+    }
+
+    pub fn set_session_owner(&mut self, owner: [u8; 4]) {
+        self.session_owner = owner;
+    }
+
+    /// The SE's ECKey session key pair, created on first use and persisted.
+    pub fn ensure_eckey_session_key(&mut self) {
+        if self.objects.contains_key(&RESERVED_ID_ECKEY_SESSION) {
+            return;
+        }
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let pk = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
+        self.objects.insert(RESERVED_ID_ECKEY_SESSION, SecureObject::ECKeyPair {
+            curve: crate::object_store::types::ECCurve::NistP256,
+            private_key: sk.to_bytes().to_vec(),
+            public_key: pk,
+        });
         self.persist();
     }
 
@@ -151,13 +233,18 @@ impl ObjectStore {
         self.metadata.get(id)
     }
 
-    /// No attached policy means the applet default allows the operation.
-    /// Once a policy is attached, an omitted permission is a denial.
+    /// No attached policy means the applet default: everything for ordinary
+    /// objects, read only for Authentication Objects (AN12543 table 17).
+    /// Once a policy is attached, only the access rule of the current session
+    /// owner applies (rules are not inherited across owners, AN12543 3.7.1.2);
+    /// an owner without a rule, or an omitted permission, is a denial.
     pub fn policy_allows(&self, id: &[u8; 4], permission: u32) -> bool {
-        match self.metadata.get(id).and_then(|m| m.policy.as_deref()) {
-            Some(raw) => crate::policy::ar_header_union(raw)
+        let meta = self.metadata.get(id);
+        match meta.and_then(|m| m.policy.as_deref()) {
+            Some(raw) => crate::policy::ar_header_for(raw, &self.session_owner)
                 .map(|header| header & permission != 0)
                 .unwrap_or(false),
+            None if meta.and_then(|m| m.auth).is_some() => permission == crate::policy::POLICY_OBJ_ALLOW_READ,
             None => true,
         }
     }

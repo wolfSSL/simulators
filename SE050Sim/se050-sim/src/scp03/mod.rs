@@ -261,6 +261,22 @@ impl Scp03State {
 }
 
 impl Session {
+    /// A session whose keys come from elsewhere: the ECKey applet session
+    /// derives them from its master key (AN12543 3.6.3.3) and starts with the
+    /// command counter at 1 and an initial MAC chaining value.
+    pub fn from_keys(s_enc: Vec<u8>, s_mac: Vec<u8>, s_rmac: Vec<u8>, mcv: [u8; 16], security_level: u8) -> Self {
+        Session {
+            s_enc,
+            s_mac,
+            s_rmac,
+            security_level,
+            mcv,
+            cmd_counter: 1,
+            last_cmd_len: 0,
+            legacy: false,
+        }
+    }
+
     /// Unwrap a secured command: verify the C-MAC, decrypt the data field if
     /// C-DECRYPTION is active, and return the inner plain APDU for dispatch.
     /// A MAC/padding failure returns Err(SW) and the caller drops the session.

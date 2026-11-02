@@ -21,6 +21,7 @@
 
 pub mod apdu;
 pub mod applet;
+pub mod applet_session;
 pub mod dispatch;
 pub mod handlers;
 pub mod object_store;

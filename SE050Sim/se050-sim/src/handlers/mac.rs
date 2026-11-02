@@ -150,6 +150,12 @@ pub fn handle_oneshot(apdu: &ParsedApdu, store: &mut ObjectStore, validate: bool
         Some(obj) => obj.clone(),
         None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
+    // Generating a MAC needs POLICY_OBJ_ALLOW_SIGN for the current session
+    // owner; validating needs POLICY_OBJ_ALLOW_VERIFY (AN12543 policy table).
+    let needed = if validate { crate::policy::POLICY_OBJ_ALLOW_VERIFY } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
+    if !store.policy_allows(&key_id, needed) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
     match compute_mac(algo, &key_obj, &data) {
         Ok(mac) => mac_response(mac, expected.as_deref()),
         Err(sw) => ApduResponse::error(sw),
@@ -260,6 +266,12 @@ pub fn handle_final(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse 
         Some(obj) => obj.clone(),
         None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
+    // Generating a MAC needs POLICY_OBJ_ALLOW_SIGN for the current session
+    // owner; validating needs POLICY_OBJ_ALLOW_VERIFY (AN12543 policy table).
+    let needed = if validate { crate::policy::POLICY_OBJ_ALLOW_VERIFY } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
+    if !store.policy_allows(&key_id, needed) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
     match compute_mac(algo, &key_obj, &data) {
         Ok(mac) => mac_response(mac, expected.as_deref()),
         Err(sw) => ApduResponse::error(sw),

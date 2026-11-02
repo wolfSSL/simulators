@@ -29,3 +29,4 @@ pub mod rsa;
 pub mod aes;
 pub mod digest;
 pub mod mac;
+pub mod kdf;

@@ -129,6 +129,11 @@ impl ObjectStore {
         self.objects.get(id)
     }
 
+    /// Persist after an in-place change made through get_mut().
+    pub fn touch(&mut self) {
+        self.persist();
+    }
+
     pub fn get_mut(&mut self, id: &[u8; 4]) -> Option<&mut SecureObject> {
         self.objects.get_mut(id)
     }

@@ -52,6 +52,17 @@ pub fn dispatch(apdu: &ParsedApdu, store: &mut ObjectStore, scp_active: bool) ->
     let base_ins = apdu.base_ins();
     let cred_type = apdu.cred_type();
 
+    // Applet-reserved objects (e.g. the ECKey session key pair) are only
+    // readable: any other command naming one of them is refused.
+    let read_only = base_ins == INS_READ || (base_ins == INS_MGMT && apdu.p2 == P2_EXIST);
+    if !read_only {
+        if let Ok(tlvs) = apdu.parse_tlvs() {
+            if tlvs.iter().any(|t| crate::object_store::is_reserved_id(&t.value)) {
+                return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        }
+    }
+
     match base_ins {
         INS_WRITE => match cred_type {
             P1_EC => handlers::ec::handle_write_ec_key(apdu, store, version),

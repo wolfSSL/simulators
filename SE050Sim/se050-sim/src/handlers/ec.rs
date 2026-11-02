@@ -106,6 +106,27 @@ pub fn handle_write_ec_key(
         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
     }
 
+    // INS_AUTH_OBJECT: an ECKey Authentication Object, NIST P-256 only (the
+    // curve of ECKey sessions), with an optional maximum number of failed
+    // attempts (two bytes, 0 = unlimited, at most 0x7FFF). Checked before
+    // anything is stored; an existing Authentication Object keeps the curve.
+    let auth_object = apdu.ins & 0x40 != 0;
+    let max_attempts = if auth_object {
+        match tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS) {
+            None => 0,
+            Some(t) if t.value.len() == 2 => match u16::from_be_bytes([t.value[0], t.value[1]]) {
+                v @ 0..=0x7FFF => v,
+                _ => return ApduResponse::error(SW_WRONG_DATA),
+            },
+            Some(_) => return ApduResponse::error(SW_WRONG_DATA),
+        }
+    } else {
+        0
+    };
+    if (auth_object || store.auth_state(&obj_id).is_some()) && !matches!(curve, ECCurve::NistP256) {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+
     // Check what key data is provided
     let private_key_data = tlv::find_tlv(&tlvs, TAG_3).map(|t| t.value.clone());
     let public_key_data = tlv::find_tlv(&tlvs, TAG_4)
@@ -147,14 +168,8 @@ pub fn handle_write_ec_key(
             creation_policy,
             if generated { 0x02 } else { 0x01 },
         );
-        // INS_AUTH_OBJECT: an ECKey Authentication Object, with its maximum
-        // number of failed attempts (0 = unlimited, at most 0x7FFF).
-        if apdu.ins & 0x40 != 0 {
-            let max = tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS)
-                .filter(|t| t.value.len() == 2)
-                .map(|t| u16::from_be_bytes([t.value[0], t.value[1]]) & 0x7FFF)
-                .unwrap_or(0);
-            store.set_auth_object(obj_id, max);
+        if auth_object {
+            store.set_auth_object(obj_id, max_attempts);
         }
     }
     response
@@ -511,6 +526,10 @@ pub fn handle_sign(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
         // on 3.1.1 and 7.2.0), not 0x6A82.
         None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
+    // Signing needs POLICY_OBJ_ALLOW_SIGN for the current session owner.
+    if !store.policy_allows(&key_id, crate::policy::POLICY_OBJ_ALLOW_SIGN) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
 
     // Weierstrass ECDSA enforces input length == algo digest length.
     if let SecureObject::ECKeyPair { curve, .. } = &key_obj {
@@ -759,6 +778,10 @@ pub fn handle_ecdh(apdu: &ParsedApdu, store: &mut ObjectStore, strict: bool) -> 
         Some(obj) => obj.clone(),
         None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
+    // Key agreement needs POLICY_OBJ_ALLOW_KA for the current session owner.
+    if !store.policy_allows(&key_id, crate::policy::POLICY_OBJ_ALLOW_KA) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
 
     // On the real applet the Tag7 target must already exist as an HMACKey
     // object; the applet refuses to create it implicitly. In lenient mode a

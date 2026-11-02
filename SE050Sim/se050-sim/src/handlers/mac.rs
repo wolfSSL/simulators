@@ -152,7 +152,7 @@ pub fn handle_oneshot(apdu: &ParsedApdu, store: &mut ObjectStore, validate: bool
     };
     // Generating a MAC needs POLICY_OBJ_ALLOW_SIGN for the current session
     // owner; validating needs POLICY_OBJ_ALLOW_VERIFY (AN12543 policy table).
-    let needed = if validate { 0x0800_0000 } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
+    let needed = if validate { crate::policy::POLICY_OBJ_ALLOW_VERIFY } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
     if !store.policy_allows(&key_id, needed) {
         return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
     }
@@ -268,7 +268,7 @@ pub fn handle_final(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse 
     };
     // Generating a MAC needs POLICY_OBJ_ALLOW_SIGN for the current session
     // owner; validating needs POLICY_OBJ_ALLOW_VERIFY (AN12543 policy table).
-    let needed = if validate { 0x0800_0000 } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
+    let needed = if validate { crate::policy::POLICY_OBJ_ALLOW_VERIFY } else { crate::policy::POLICY_OBJ_ALLOW_SIGN };
     if !store.policy_allows(&key_id, needed) {
         return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
     }

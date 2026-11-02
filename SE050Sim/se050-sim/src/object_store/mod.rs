@@ -94,6 +94,16 @@ pub struct ObjectStore {
 /// own NIST P-256 key pair used for ECKey session key agreement.
 pub const RESERVED_ID_ECKEY_SESSION: [u8; 4] = [0x7F, 0xFF, 0x02, 0x01];
 
+/// Applet-reserved objects the simulator manages itself. Hosts may read them
+/// (public part, attributes, existence) but not create, replace, delete or
+/// use them in generic crypto commands; only the applet's own flows use the
+/// private keys.
+pub const RESERVED_IDS: &[[u8; 4]] = &[RESERVED_ID_ECKEY_SESSION];
+
+pub fn is_reserved_id(id: &[u8]) -> bool {
+    RESERVED_IDS.iter().any(|r| r[..] == *id)
+}
+
 fn default_curves() -> HashMap<u8, u8> {
     // P-192, P-224, P-256, P-384, P-521 fully parameterized.
     (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
@@ -160,7 +170,8 @@ impl ObjectStore {
     /// Mark a freshly created object as an Authentication Object.
     pub fn set_auth_object(&mut self, id: [u8; 4], max_attempts: u16) {
         if let Some(m) = self.metadata.get_mut(&id) {
-            m.auth = Some(crate::object_store::types::AuthState { max_attempts, attempts: 0 });
+            let instance = rand::RngCore::next_u64(&mut rand::rngs::OsRng);
+            m.auth = Some(crate::object_store::types::AuthState { max_attempts, attempts: 0, instance });
             self.persist();
         }
     }

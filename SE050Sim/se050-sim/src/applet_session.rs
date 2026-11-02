@@ -251,6 +251,12 @@ impl AppletSessions {
                     self.sessions.remove(&sid);
                     return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
                 }
+                // The object may have been blocked by another handshake since
+                // INITIALIZE UPDATE: a pending one neither passes nor unblocks it.
+                if store.auth_blocked(&auth_id) {
+                    self.sessions.remove(&sid);
+                    return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+                }
                 let resp = pending.external_authenticate(&raw);
                 if std::env::var("SE050_SIM_TRACE").map(|v| v == "1").unwrap_or(false) {
                     eprintln!("[trace] extauth  84 82 {:02x} {:02x} -> {:04x}", raw[2], raw[3], resp.sw);
@@ -401,10 +407,16 @@ fn read_attested(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
 /// Authentication Object as the policy owner.
 fn run_in_session(cmd: &ParsedApdu, auth_id: [u8; 4], store: &mut ObjectStore, scp_active: bool) -> ApduResponse {
     store.set_session_owner(auth_id);
-    if cmd.base_ins() == INS_READ {
+    let r = if cmd.base_ins() == INS_READ {
         store.ensure_eckey_session_key();
-    }
-    let r = crate::dispatch::dispatch(cmd, store, scp_active);
+        if cmd.ins & INS_ATTEST != 0 {
+            read_attested(cmd, store)
+        } else {
+            crate::dispatch::dispatch(cmd, store, scp_active)
+        }
+    } else {
+        crate::dispatch::dispatch(cmd, store, scp_active)
+    };
     store.set_session_owner([0; 4]);
     r
 }
@@ -1000,5 +1012,127 @@ mod tests {
         let r = run(&mut s, &mut store, &ec_auth_write(&AUTH_ID, 0x03, Some(&[0x7F, 0xFF]), &p256_pub));
         assert_eq!(r.sw, SW_NO_ERROR);
         assert_eq!(store.auth_state(&AUTH_ID).unwrap().max_attempts, 0x7FFF);
+    }
+
+    /// AESKey handshake up to (not including) EXTERNAL AUTHENTICATE: the
+    /// command authenticating with `key`.
+    fn aes_init(s: &mut AppletSessions, store: &mut ObjectStore, sid: &[u8; 8], key: &[u8]) -> Vec<u8> {
+        let host_ch = [7u8; 8];
+        let r = process(s, store, sid, &cmd(0x80, INS_INITIALIZE_UPDATE, 0x00, 0x00, &host_ch));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        let mut card_ch = [0u8; 8];
+        card_ch.copy_from_slice(&r.data[13..21]);
+        let (_, s_mac, _) = crypto::derive_session_keys(key, key, &host_ch, &card_ch).unwrap();
+        let host_crypto = crypto::cryptogram(&s_mac, &host_ch, &card_ch, 0x01).unwrap();
+        let mut ea = vec![0x84, INS_EXTERNAL_AUTHENTICATE, 0x33, 0x00, 0x10];
+        ea.extend_from_slice(&host_crypto);
+        let mcv = crypto::cmac_chain(&s_mac, &[0u8; 16], &ea).unwrap();
+        ea.extend_from_slice(&mcv[..8]);
+        ea
+    }
+
+    fn aes_auth_write(id: &[u8; 4], key: &[u8], extra: &[u8]) -> Vec<u8> {
+        let mut d = extra.to_vec();
+        d.extend(tlv(TAG_1, id));
+        d.extend(tlv(crate::tlv::TAG_3, key));
+        cmd(0x80, INS_WRITE | 0x40, P1_AES, 0x00, &d)
+    }
+
+    #[test]
+    fn pending_aes_handshake_neither_passes_nor_clears_a_block() {
+        let (mut store, mut s) = demo_store();
+        const AES1: [u8; 4] = [0x7D, 0xA0, 0x00, 0x20];
+        let key = [0x33u8; 16];
+        let r = run(&mut s, &mut store, &aes_auth_write(&AES1, &key, &tlv(crate::tlv::TAG_MAX_ATTEMPTS, &[0, 1])));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        let sid1 = create_for(&mut s, &mut store, AES1);
+        let sid2 = create_for(&mut s, &mut store, AES1);
+        let bad = aes_init(&mut s, &mut store, &sid1, &[0u8; 16]);
+        let good = aes_init(&mut s, &mut store, &sid2, &key);
+        assert_eq!(process(&mut s, &mut store, &sid1, &bad).sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(store.auth_blocked(&AES1));
+        assert_eq!(process(&mut s, &mut store, &sid2, &good).sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(store.auth_blocked(&AES1));
+        assert_eq!(store.auth_state(&AES1).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn aes_authentication_object_policies_and_key_length() {
+        let (mut store, mut s) = demo_store();
+        const AES1: [u8; 4] = [0x7D, 0xA0, 0x00, 0x20];
+        const AES2: [u8; 4] = [0x7D, 0xA0, 0x00, 0x21];
+        // No policy: read only, so it neither encrypts nor decrypts in the
+        // default session, one-shot or multi-part.
+        assert_eq!(run(&mut s, &mut store, &aes_auth_write(&AES1, &[0x33; 16], &[])).sw, SW_NO_ERROR);
+        for p2 in [P2_ENCRYPT_ONESHOT, P2_DECRYPT_ONESHOT] {
+            let mut d = tlv(TAG_1, &AES1);
+            d.extend(tlv(crate::tlv::TAG_2, &[0x0D])); // AES ECB
+            d.extend(tlv(crate::tlv::TAG_3, &[0u8; 16]));
+            assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_CRYPTO, P1_CIPHER, p2, &d)).sw, SW_COMMAND_NOT_ALLOWED);
+        }
+        let mut co = tlv(TAG_1, &[0x00, 0x10]);
+        co.extend(tlv(crate::tlv::TAG_2, &[0x02]));
+        co.extend(tlv(crate::tlv::TAG_3, &[0x0D]));
+        assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE, P1_CRYPTO_OBJ, 0, &co)).sw, SW_NO_ERROR);
+        for p2 in [P2_ENCRYPT_INIT, P2_DECRYPT_INIT] {
+            let mut d = tlv(TAG_1, &AES1);
+            d.extend(tlv(crate::tlv::TAG_2, &[0x00, 0x10]));
+            assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_CRYPTO, P1_CIPHER, p2, &d)).sw, SW_COMMAND_NOT_ALLOWED);
+        }
+        // Writable (policy for the default session): updates must stay AES-128.
+        let mut pol = vec![8];
+        pol.extend_from_slice(&[0; 4]);
+        pol.extend_from_slice(&(crate::policy::POLICY_OBJ_ALLOW_WRITE | crate::policy::POLICY_OBJ_ALLOW_READ).to_be_bytes());
+        let pol = tlv(crate::tlv::TAG_POLICY, &pol);
+        assert_eq!(run(&mut s, &mut store, &aes_auth_write(&AES2, &[0x44; 16], &pol)).sw, SW_NO_ERROR);
+        let mut upd = tlv(TAG_1, &AES2);
+        upd.extend(tlv(crate::tlv::TAG_3, &[0x55; 32]));
+        assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE, P1_AES, 0, &upd)).sw, SW_WRONG_DATA);
+        assert!(matches!(store.get(&AES2), Some(SecureObject::AESKey { key }) if key == &[0x44; 16]));
+        let mut upd = tlv(TAG_1, &AES2);
+        upd.extend(tlv(crate::tlv::TAG_3, &[0x55; 16]));
+        assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE, P1_AES, 0, &upd)).sw, SW_NO_ERROR);
+        assert!(store.auth_state(&AES2).is_some());
+        // Malformed maximum attempts, AESKey and UserID.
+        const AES3: [u8; 4] = [0x7D, 0xA0, 0x00, 0x22];
+        let r = run(&mut s, &mut store, &aes_auth_write(&AES3, &[0x33; 16], &tlv(crate::tlv::TAG_MAX_ATTEMPTS, &[1])));
+        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert!(!store.exists(&AES3));
+        let mut d = tlv(crate::tlv::TAG_MAX_ATTEMPTS, &[0, 0, 1]);
+        d.extend(tlv(TAG_1, &AES3));
+        d.extend(tlv(crate::tlv::TAG_2, b"abcd"));
+        assert_eq!(run(&mut s, &mut store, &cmd(0x80, INS_WRITE | 0x40, P1_USERID, 0, &d)).sw, SW_WRONG_DATA);
+        assert!(!store.exists(&AES3));
+    }
+
+    #[test]
+    fn attested_read_inside_a_session_and_reserved_attestation_key() {
+        let (mut store, mut s) = demo_store();
+        const UID: [u8; 4] = [0x7D, 0xA0, 0x00, 0x01];
+        const ECKEY: [u8; 4] = [0x7D, 0xA0, 0x00, 0x03];
+        let att = crate::object_store::RESERVED_ID_ATTESTATION_KEY;
+        let sid = create_for(&mut s, &mut store, UID);
+        let right = cmd(0x80, INS_MGMT, 0, P2_SESSION_USERID, &tlv(TAG_1, &[0xC0, 1, 2, 3, 4]));
+        assert_eq!(process(&mut s, &mut store, &sid, &right).sw, SW_NO_ERROR);
+        let mut d = tlv(TAG_1, &ECKEY);
+        d.extend(tlv(crate::tlv::TAG_5, &att));
+        d.extend(tlv(crate::tlv::TAG_6, &[0x21]));
+        d.extend(tlv(crate::tlv::TAG_7, &[0x5A; 16]));
+        let r = process(&mut s, &mut store, &sid, &cmd(0x80, INS_READ | INS_ATTEST, 0, 0, &d));
+        assert_eq!(r.sw, SW_NO_ERROR);
+        let t = crate::tlv::parse_tlvs(&r.data).unwrap();
+        let Some(SecureObject::ECPublicKey { public_key, .. }) = store.get(&ECKEY) else { panic!() };
+        assert_eq!(&tlv::find_tlv(&t, TAG_1).unwrap().value, public_key);
+        assert!(tlv::find_tlv(&t, 0x52).is_some(), "signature");
+        // The attestation key itself only reads: no generic signing with it.
+        let mut sign = tlv(TAG_1, &att);
+        sign.extend(tlv(crate::tlv::TAG_2, &[0x21]));
+        sign.extend(tlv(crate::tlv::TAG_3, &[0x11; 32]));
+        let r = process(&mut s, &mut store, &sid, &cmd(0x80, INS_CRYPTO, P1_SIGNATURE, P2_SIGN, &sign));
+        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_CRYPTO, P1_SIGNATURE, P2_SIGN, &sign));
+        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
+        let r = run(&mut s, &mut store, &cmd(0x80, INS_MGMT, 0, P2_DELETE_OBJECT, &tlv(TAG_1, &att)));
+        assert_eq!(r.sw, SW_CONDITIONS_NOT_SATISFIED);
     }
 }

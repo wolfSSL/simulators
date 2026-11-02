@@ -118,6 +118,20 @@ pub enum TlvError {
 pub const TAG_SESSION_ID: u8 = 0x10;
 pub const TAG_POLICY: u8 = 0x11;
 pub const TAG_MAX_ATTEMPTS: u8 = 0x12;
+
+/// Maximum number of failed attempts of an Authentication Object: two bytes,
+/// 0 (= unlimited) to `limit`; 0 when the tag is absent. Err when the tag is
+/// present but malformed or out of range.
+pub fn max_attempts(tlvs: &[Tlv], limit: u16) -> Result<u16, ()> {
+    match find_tlv(tlvs, TAG_MAX_ATTEMPTS) {
+        None => Ok(0),
+        Some(t) if t.value.len() == 2 => {
+            let v = u16::from_be_bytes([t.value[0], t.value[1]]);
+            if v <= limit { Ok(v) } else { Err(()) }
+        }
+        Some(_) => Err(()),
+    }
+}
 pub const TAG_1: u8 = 0x41;
 pub const TAG_2: u8 = 0x42;
 pub const TAG_3: u8 = 0x43;

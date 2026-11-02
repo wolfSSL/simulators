@@ -43,13 +43,9 @@ fn handle_write_userid(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRespon
     if store.exists(&obj_id) {
         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
     }
-    let max = tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS)
-        .filter(|t| t.value.len() == 2)
-        .map(|t| u16::from_be_bytes([t.value[0], t.value[1]]))
-        .unwrap_or(0);
-    if max > 255 {
+    let Ok(max) = crate::tlv::max_attempts(&tlvs, 255) else {
         return ApduResponse::error(SW_WRONG_DATA);
-    }
+    };
     let policy = match crate::policy::creation_policy(&tlvs) {
         Ok(p) => p,
         Err(_) => return ApduResponse::error(SW_WRONG_DATA),

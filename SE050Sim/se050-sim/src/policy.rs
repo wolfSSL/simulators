@@ -36,6 +36,8 @@ pub const POLICY_OBJ_ALLOW_DELETE: u32 = 0x0004_0000;
 pub const POLICY_OBJ_ALLOW_SIGN: u32 = 0x1000_0000;
 pub const POLICY_OBJ_ALLOW_VERIFY: u32 = 0x0800_0000;
 pub const POLICY_OBJ_ALLOW_KA: u32 = 0x0400_0000;
+pub const POLICY_OBJ_ALLOW_ENC: u32 = 0x0200_0000;
+pub const POLICY_OBJ_ALLOW_DEC: u32 = 0x0100_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPolicy;

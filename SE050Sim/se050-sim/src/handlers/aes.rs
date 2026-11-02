@@ -216,7 +216,7 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
     // Check if this is key generation (P2=Generate) or has a key size tag
     let generated = apdu.p2 == P2_GENERATE
         || key_data.as_ref().is_some_and(|d| d.len() <= 2);
-    let response = if generated {
+    let key = if generated {
         // Key generation: Tag3 contains 2-byte key size
         let key_len = key_data
             .as_ref()
@@ -234,38 +234,42 @@ pub fn handle_write_aes_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduR
 
         let mut key = vec![0u8; key_len_bytes];
         rand::thread_rng().fill_bytes(&mut key);
-        store.insert(obj_id, SecureObject::AESKey { key });
-        ApduResponse::success()
+        key
     } else if let Some(key) = key_data {
         // Import key data
         if key.len() != 16 && key.len() != 24 && key.len() != 32 {
             return ApduResponse::error(SW_WRONG_DATA);
         }
-        store.insert(obj_id, SecureObject::AESKey { key });
-        ApduResponse::success()
+        key
     } else {
-        ApduResponse::error(SW_WRONG_DATA)
+        return ApduResponse::error(SW_WRONG_DATA);
     };
-    if response.sw == SW_NO_ERROR && !object_existed {
+
+    // INS_AUTH_OBJECT: an AESKey Authentication Object, AES-128 only, with an
+    // optional maximum number of failed attempts. Checked before anything is
+    // stored; an existing Authentication Object stays AES-128 on update.
+    let auth_object = apdu.ins & 0x40 != 0;
+    let max_attempts = match crate::tlv::max_attempts(&tlvs, 0x7FFF) {
+        Ok(v) if auth_object => v,
+        Err(()) if auth_object => return ApduResponse::error(SW_WRONG_DATA),
+        _ => 0,
+    };
+    if (auth_object || store.auth_state(&obj_id).is_some()) && key.len() != 16 {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+
+    store.insert(obj_id, SecureObject::AESKey { key });
+    if !object_existed {
         store.set_creation_metadata(
             obj_id,
             creation_policy,
             if generated { 0x02 } else { 0x01 },
         );
-        // INS_AUTH_OBJECT: an AESKey Authentication Object (AES-128 only).
-        if apdu.ins & 0x40 != 0 {
-            if !matches!(store.get(&obj_id), Some(SecureObject::AESKey { key }) if key.len() == 16) {
-                store.remove(&obj_id);
-                return ApduResponse::error(SW_WRONG_DATA);
-            }
-            let max = tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS)
-                .filter(|t| t.value.len() == 2)
-                .map(|t| u16::from_be_bytes([t.value[0], t.value[1]]) & 0x7FFF)
-                .unwrap_or(0);
-            store.set_auth_object(obj_id, max);
+        if auth_object {
+            store.set_auth_object(obj_id, max_attempts);
         }
     }
-    response
+    ApduResponse::success()
 }
 
 /// Handle WRITE HMAC key command (WriteSymmKey with P1=HMAC).
@@ -322,6 +326,16 @@ pub fn handle_write_hmac_key(apdu: &ParsedApdu, store: &mut ObjectStore) -> Apdu
     }
 }
 
+/// Encrypting needs POLICY_OBJ_ALLOW_ENC, decrypting POLICY_OBJ_ALLOW_DEC,
+/// for the current session owner.
+fn cipher_permission(encrypting: bool) -> u32 {
+    if encrypting {
+        crate::policy::POLICY_OBJ_ALLOW_ENC
+    } else {
+        crate::policy::POLICY_OBJ_ALLOW_DEC
+    }
+}
+
 /// Shared body of the encrypt/decrypt one-shot handlers.
 /// Tag1=key_id(4B), Tag2=cipher_mode(1B), Tag3=input, Tag4=IV(opt)
 fn handle_cipher_oneshot(
@@ -366,6 +380,9 @@ fn handle_cipher_oneshot(
         Some(obj) => obj.clone(),
         None => return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED),
     };
+    if !store.policy_allows(&key_id, cipher_permission(encrypting)) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
+    }
 
     let key_data = match &key_obj {
         SecureObject::AESKey { key } => key,
@@ -427,6 +444,10 @@ pub fn handle_cipher_init(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduRes
     }
     if !store.exists(&key_id) {
         return ApduResponse::error(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    // The key is bound to the crypto object here; update and final reuse it.
+    if !store.policy_allows(&key_id, cipher_permission(encrypting)) {
+        return ApduResponse::error(SW_COMMAND_NOT_ALLOWED);
     }
 
     let mut chain = vec![0u8; 16];

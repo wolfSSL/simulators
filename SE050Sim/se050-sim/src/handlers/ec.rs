@@ -111,17 +111,11 @@ pub fn handle_write_ec_key(
     // attempts (two bytes, 0 = unlimited, at most 0x7FFF). Checked before
     // anything is stored; an existing Authentication Object keeps the curve.
     let auth_object = apdu.ins & 0x40 != 0;
-    let max_attempts = if auth_object {
-        match tlv::find_tlv(&tlvs, crate::tlv::TAG_MAX_ATTEMPTS) {
-            None => 0,
-            Some(t) if t.value.len() == 2 => match u16::from_be_bytes([t.value[0], t.value[1]]) {
-                v @ 0..=0x7FFF => v,
-                _ => return ApduResponse::error(SW_WRONG_DATA),
-            },
-            Some(_) => return ApduResponse::error(SW_WRONG_DATA),
-        }
-    } else {
-        0
+    let max_attempts = match crate::tlv::max_attempts(&tlvs, 0x7FFF) {
+        Ok(v) if auth_object => v,
+        Ok(_) => 0,
+        Err(()) if auth_object => return ApduResponse::error(SW_WRONG_DATA),
+        Err(()) => 0,
     };
     if (auth_object || store.auth_state(&obj_id).is_some()) && !matches!(curve, ECCurve::NistP256) {
         return ApduResponse::error(SW_WRONG_DATA);

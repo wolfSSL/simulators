@@ -91,6 +91,128 @@ fn default_curves() -> HashMap<u8, u8> {
     (0x01..=0x05).map(|id| (id, CURVE_PARAMS_COMPLETE)).collect()
 }
 
+/// Writes the persisted store without holding up the APDU being processed:
+/// a background thread writes the latest snapshot of each store file. A
+/// synchronous write in the command path took up to a second on a busy disk,
+/// longer than hosts wait for an answer (NXP's T=1 stack then asks for a
+/// retransmission).
+///
+/// - Snapshots are coalesced per destination path, so several stores in one
+///   process never discard each other's updates.
+/// - `flush_store` waits until a path has no queued or in-flight write; it runs
+///   before a store file is loaded and when a persistent store is dropped, so
+///   reopening a store never reads stale state.
+/// - The file holds private keys and SCP03 keys: it is written to a temporary
+///   file created with mode 0600 (or the existing file's mode), then renamed.
+mod writer {
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct State {
+        pending: HashMap<PathBuf, String>,
+        in_flight: HashSet<PathBuf>,
+    }
+
+    struct Writer {
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+
+    static WRITER: OnceLock<&'static Writer> = OnceLock::new();
+
+    fn writer() -> &'static Writer {
+        WRITER.get_or_init(|| {
+            let w: &'static Writer = Box::leak(Box::new(Writer {
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            std::thread::spawn(move || run(w));
+            w
+        })
+    }
+
+    fn run(w: &'static Writer) {
+        loop {
+            let batch: Vec<(PathBuf, String)> = {
+                let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                while st.pending.is_empty() {
+                    st = w.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                let batch: Vec<_> = st.pending.drain().collect();
+                for (p, _) in &batch {
+                    st.in_flight.insert(p.clone());
+                }
+                batch
+            };
+            for (path, json) in &batch {
+                write_file(path, json);
+            }
+            let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (p, _) in &batch {
+                st.in_flight.remove(p);
+            }
+            w.cv.notify_all();
+        }
+    }
+
+    fn write_file(path: &Path, json: &str) {
+        use std::io::Write;
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        let _ = std::fs::remove_file(&tmp);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let Ok(mut f) = opts.open(&tmp) else { return };
+        // Keep the access restrictions of the file being replaced.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
+        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
+            drop(f);
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    pub fn write_store(path: &Path, json: String) {
+        let w = writer();
+        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending.insert(path.to_path_buf(), json);
+        w.cv.notify_all();
+    }
+
+    /// Blocks until `path` has no queued or in-flight write.
+    pub fn flush_store(path: &Path) {
+        let Some(w) = WRITER.get() else { return };
+        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending.contains_key(path) || st.in_flight.contains(path) {
+            st = w.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+use writer::{flush_store, write_store};
+
+/// A persistent store finishes writing its file before it goes away, so a
+/// store reopened on the same file (or an orderly shutdown) sees every update.
+impl Drop for ObjectStore {
+    fn drop(&mut self) {
+        if let Some(path) = &self.persist_path {
+            flush_store(path);
+        }
+    }
+}
+
 impl ObjectStore {
     pub fn new() -> Self {
         Self {
@@ -287,12 +409,13 @@ impl ObjectStore {
             "platform_scp": self.platform_scp,
         });
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
-            let _ = std::fs::write(path, json);
+            write_store(path, json);
         }
     }
 
     fn load(&mut self) {
         let Some(path) = &self.persist_path else { return };
+        flush_store(path);
         let Ok(json) = std::fs::read_to_string(path) else { return };
         let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(&json) else {
             return;
@@ -465,6 +588,60 @@ mod persistence_tests {
         assert_eq!(loaded.enc, config.enc);
         assert_eq!(loaded.mac, config.mac);
         assert_eq!(loaded.dek, config.dek);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_stores_on_different_paths_keep_their_latest_snapshot() {
+        let a = unique_store_path("writer_path_a");
+        let b = unique_store_path("writer_path_b");
+        {
+            let mut sa = ObjectStore::with_persistence(a.clone());
+            let mut sb = ObjectStore::with_persistence(b.clone());
+            for i in 0..50u8 {
+                sa.insert([0, 0, 0xA0, i], SecureObject::Binary { data: vec![i] });
+                sb.insert([0, 0, 0xB0, i], SecureObject::Binary { data: vec![i] });
+            }
+        }
+        let sa = ObjectStore::with_persistence(a.clone());
+        let sb = ObjectStore::with_persistence(b.clone());
+        for i in 0..50u8 {
+            assert!(sa.exists(&[0, 0, 0xA0, i]) && !sa.exists(&[0, 0, 0xB0, i]));
+            assert!(sb.exists(&[0, 0, 0xB0, i]) && !sb.exists(&[0, 0, 0xA0, i]));
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn test_reopen_sees_updates_of_a_store_still_open() {
+        let path = unique_store_path("writer_reopen");
+        let mut first = ObjectStore::with_persistence(path.clone());
+        first.set_scp_required(true);
+        let second = ObjectStore::with_persistence(path.clone());
+        assert!(second.scp_required());
+        drop(first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_file_is_private_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_store_path("writer_mode");
+        let mode = |p: &PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.insert([0, 0, 0, 1], SecureObject::Binary { data: vec![1] });
+        }
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        {
+            let mut store = ObjectStore::with_persistence(path.clone());
+            store.insert([0, 0, 0, 2], SecureObject::Binary { data: vec![2] });
+        }
+        assert_eq!(mode(&path), 0o640);
+        assert!(ObjectStore::with_persistence(path.clone()).exists(&[0, 0, 0, 2]));
         let _ = std::fs::remove_file(&path);
     }
 }

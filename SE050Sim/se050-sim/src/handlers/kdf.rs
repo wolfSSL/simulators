@@ -26,7 +26,8 @@
 //! salt (optional; empty = default salt of zeros), TAG_4 info (optional),
 //! TAG_5 2-byte output length (1..768), TAG_7 optional target object (HMACKey
 //! or AESKey of exactly that length) instead of returning the output.
-//! TAG_6 (salt from an HMACKey) is not modelled.
+//! TAG_6 (salt from an HMACKey) is not modelled and is refused with 0x6A80;
+//! a TAG_7 that is not a 4-byte object ID is refused too.
 
 use hmac::{Mac, SimpleHmac};
 
@@ -83,6 +84,19 @@ pub fn handle_hkdf(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     if len == 0 || len > 768 {
         return ApduResponse::error(SW_WRONG_DATA);
     }
+    // TAG_6 names an object holding the salt (Se05x_API_HKDF_Extended).
+    // Not supported yet: refused rather than silently using the zero salt.
+    if tlv::find_tlv(&tlvs, crate::tlv::TAG_6).is_some() {
+        return ApduResponse::error(SW_WRONG_DATA);
+    }
+    // TAG_7 present = output into that object; it must be an object ID.
+    let target: Option<[u8; 4]> = match tlv::find_tlv(&tlvs, TAG_7) {
+        None => None,
+        Some(t) => match <[u8; 4]>::try_from(t.value.as_slice()) {
+            Ok(id) => Some(id),
+            Err(_) => return ApduResponse::error(SW_WRONG_DATA),
+        },
+    };
     let salt = tlv::find_tlv(&tlvs, TAG_3).map(|t| t.value.clone()).unwrap_or_default();
     let info = tlv::find_tlv(&tlvs, TAG_4).map(|t| t.value.clone()).unwrap_or_default();
     let ikm = match store.get(&id) {
@@ -102,7 +116,7 @@ pub fn handle_hkdf(apdu: &ParsedApdu, store: &mut ObjectStore) -> ApduResponse {
     let Some(out) = out else {
         return ApduResponse::error(SW_WRONG_DATA);
     };
-    if let Some(target) = tlv::find_tlv(&tlvs, TAG_7).and_then(|t| <[u8; 4]>::try_from(t.value.as_slice()).ok()) {
+    if let Some(target) = target {
         // Output into an existing object of exactly the requested length.
         let fits = match store.get(&target) {
             Some(SecureObject::HMACKey { key, .. }) | Some(SecureObject::AESKey { key }) => key.len() == len,
@@ -164,5 +178,29 @@ mod tests {
         store.set_creation_metadata(id2, Some(pol), 0x01);
         raw[5 + 2..5 + 6].copy_from_slice(&id2);
         assert_eq!(handle_hkdf(&ParsedApdu::parse(&raw).unwrap(), &mut store).sw, SW_COMMAND_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn hkdf_refuses_salt_object_and_malformed_target() {
+        let mut store = ObjectStore::new();
+        let id = [0x7D, 0xA0, 0x00, 0x20];
+        store.insert(id, SecureObject::HMACKey { key: vec![0x0b; 22], policy: None });
+        let mut base = |extra: &[u8]| {
+            let mut data = Tlv::new(TAG_1, &id).encode();
+            data.extend(Tlv::new(TAG_2, &[0x04]).encode());
+            data.extend(Tlv::new(TAG_5, &[0x00, 32]).encode());
+            data.extend_from_slice(extra);
+            let mut raw = vec![0x80, INS_CRYPTO, 0x00, P2_HKDF, data.len() as u8];
+            raw.extend(data);
+            handle_hkdf(&ParsedApdu::parse(&raw).unwrap(), &mut store)
+        };
+        // salt from an object (TAG_6): not supported, refused
+        assert_eq!(base(&Tlv::new(crate::tlv::TAG_6, &[0x7D, 0xA0, 0x00, 0x30]).encode()).sw, SW_WRONG_DATA);
+        // TAG_7 that is not an object ID: refused, nothing returned
+        let r = base(&Tlv::new(TAG_7, &[0x7D, 0xA0, 0x00]).encode());
+        assert_eq!(r.sw, SW_WRONG_DATA);
+        assert!(r.data.is_empty());
+        // without either, the key comes back
+        assert_eq!(base(&[]).sw, SW_NO_ERROR);
     }
 }

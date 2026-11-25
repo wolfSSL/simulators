@@ -103,6 +103,12 @@ pub enum AlgoLayout {
     /// 12..15). The SHA3CFGR register at offset 0x28 supplies extra
     /// padding / round metadata that we model as a write-back store.
     Mp13,
+    /// F405/F415/F417 (and F2) HASH: 1-bit ALGO at CR bit 7, SHA-1 or
+    /// MD5 only. Bit 18 is reserved on these parts (the SHA-224/256
+    /// ALGO[1] bit arrived with F437/F439), so it is ignored exactly as
+    /// silicon ignores it, and the extended HR window at 0x310 does not
+    /// exist.
+    F4,
 }
 
 impl AlgoLayout {
@@ -186,6 +192,11 @@ impl HashV1 {
         Self::with_layout(AlgoLayout::Mp13)
     }
 
+    /// F405/F415/F417 layout: SHA-1 and MD5 only.
+    pub fn new_f4() -> Self {
+        Self::with_layout(AlgoLayout::F4)
+    }
+
     fn with_layout(layout: AlgoLayout) -> Self {
         Self {
             layout,
@@ -242,7 +253,8 @@ impl HashV1 {
             }
         } else {
             let lo_bit = 1u32 << self.layout_lo_bit();
-            let hi_bit = 1u32 << 18;
+            // F4 (F405/F415/F417) has no ALGO[1]: bit 18 is reserved.
+            let hi_bit = if self.layout == AlgoLayout::F4 { 0 } else { 1u32 << 18 };
             let lo = if self.cr & lo_bit != 0 { 1u32 } else { 0 };
             let hi = if self.cr & hi_bit != 0 { 1u32 } else { 0 };
             match (hi, lo) {
@@ -257,7 +269,7 @@ impl HashV1 {
 
     fn layout_lo_bit(&self) -> u32 {
         match self.layout {
-            AlgoLayout::H7 => 7,
+            AlgoLayout::H7 | AlgoLayout::F4 => 7,
             AlgoLayout::U5 => 17,
             // Unused on MP13 - that path takes the 4-bit branch in
             // parse_algo. We still need a value to type-check.
@@ -360,7 +372,7 @@ impl Peripheral for HashV1 {
                 let idx = ((o - HR_LEGACY_BASE) / 4) as usize;
                 self.read_hr(idx)
             }
-            o if (HR_EXT_BASE..=HR_EXT_END).contains(&o) => {
+            o if (HR_EXT_BASE..=HR_EXT_END).contains(&o) && self.layout != AlgoLayout::F4 => {
                 let idx = ((o - HR_EXT_BASE) / 4) as usize;
                 self.read_hr(idx)
             }
@@ -669,5 +681,32 @@ mod tests {
         // MD5 of empty string is constant.
         let expected = [0xd41d8cd9, 0x8f00b204, 0xe9800998, 0xecf8427e];
         assert_eq!(hr.as_slice(), &expected);
+    }
+
+    /// F405/F415/F417 HASH has no ALGO[1] (bit 18), so a SHA-256 request
+    /// (bits 18 and 7) runs MD5 and a SHA-224 request (bit 18) runs SHA-1,
+    /// exactly as the silicon does; the SHA-256 result window is absent.
+    #[test]
+    fn f4_layout_ignores_algo_bit_18() {
+        let mut p = HashV1::new_f4();
+        write_word(&mut p, CR, CR_ALGO_HI | CR_ALGO_LO | CR_INIT);
+        write_word(&mut p, STR, STR_DCAL);
+        let hr: Vec<u32> = (0..4)
+            .map(|i| read_word(&mut p, HR_LEGACY_BASE + i * 4))
+            .collect();
+        assert_eq!(hr.as_slice(), &[0xd41d8cd9, 0x8f00b204, 0xe9800998, 0xecf8427e]);
+        assert_eq!(read_word(&mut p, HR_EXT_BASE), 0);
+
+        let mut p = HashV1::new_f4();
+        write_word(&mut p, CR, CR_ALGO_HI | CR_INIT);
+        write_word(&mut p, DIN, 0x6162_6300);
+        write_word(&mut p, STR, STR_DCAL | 24);
+        let hr: Vec<u32> = (0..5)
+            .map(|i| read_word(&mut p, HR_LEGACY_BASE + i * 4))
+            .collect();
+        assert_eq!(
+            hr.as_slice(),
+            &[0xa9993e36, 0x4706816a, 0xba3e2571, 0x7850c26c, 0x9cd0d89d]
+        );
     }
 }

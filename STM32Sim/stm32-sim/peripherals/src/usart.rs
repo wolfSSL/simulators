@@ -66,28 +66,56 @@ impl UsartSink for CapturingSink {
     }
 }
 
-/// STM32 H7/U5 USART register layout (the F4/F7 layout differs and is
-/// not modelled here yet). Offsets:
-///   0x00 CR1   0x04 CR2   0x08 CR3   0x0C BRR
-///   0x1C ISR   0x20 ICR   0x24 RDR   0x28 TDR
+/// USART register layout generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsartLayout {
+    /// H7/U5/MP13 (and F7/L4) layout:
+    ///   0x00 CR1   0x04 CR2   0x08 CR3   0x0C BRR
+    ///   0x1C ISR   0x20 ICR   0x24 RDR   0x28 TDR
+    Modern,
+    /// F1/F2/F4 layout:
+    ///   0x00 SR    0x04 DR    0x08 BRR   0x0C CR1
+    ///   0x10 CR2   0x14 CR3   0x18 GTPR
+    Legacy,
+}
+
+/// STM32 USART, transmit side only. TXE and TC always read as set so
+/// firmware never blocks waiting for the transmitter.
 pub struct Usart {
     name: &'static str,
+    layout: UsartLayout,
     sink: Box<dyn UsartSink>,
     cr1: u32,
     cr2: u32,
     cr3: u32,
     brr: u32,
+    gtpr: u32,
 }
 
+/// ISR / SR bits 7 (TXE) and 6 (TC); the same positions in both layouts.
+const TX_READY: u32 = 0x0000_00C0;
+
 impl Usart {
+    /// H7/U5-style USART.
     pub fn new(name: &'static str, sink: Box<dyn UsartSink>) -> Self {
+        Self::with_layout(name, UsartLayout::Modern, sink)
+    }
+
+    /// F1/F2/F4-style USART.
+    pub fn new_legacy(name: &'static str, sink: Box<dyn UsartSink>) -> Self {
+        Self::with_layout(name, UsartLayout::Legacy, sink)
+    }
+
+    pub fn with_layout(name: &'static str, layout: UsartLayout, sink: Box<dyn UsartSink>) -> Self {
         Self {
             name,
+            layout,
             sink,
             cr1: 0,
             cr2: 0,
             cr3: 0,
             brr: 0,
+            gtpr: 0,
         }
     }
 }
@@ -98,27 +126,65 @@ impl Peripheral for Usart {
     }
 
     fn read(&mut self, offset: u32, _size: u8) -> u32 {
-        match offset {
-            0x00 => self.cr1,
-            0x04 => self.cr2,
-            0x08 => self.cr3,
-            0x0C => self.brr,
-            // ISR: TXE_TXFNF (bit 7) and TC (bit 6) always set so firmware
-            // never blocks waiting for the TX FIFO to drain.
-            0x1C => 0x0000_00C0,
+        match (self.layout, offset) {
+            (UsartLayout::Modern, 0x00) => self.cr1,
+            (UsartLayout::Modern, 0x04) => self.cr2,
+            (UsartLayout::Modern, 0x08) => self.cr3,
+            (UsartLayout::Modern, 0x0C) => self.brr,
+            (UsartLayout::Modern, 0x1C) => TX_READY, // ISR
+            (UsartLayout::Legacy, 0x00) => TX_READY, // SR
+            (UsartLayout::Legacy, 0x08) => self.brr,
+            (UsartLayout::Legacy, 0x0C) => self.cr1,
+            (UsartLayout::Legacy, 0x10) => self.cr2,
+            (UsartLayout::Legacy, 0x14) => self.cr3,
+            (UsartLayout::Legacy, 0x18) => self.gtpr,
             _ => 0,
         }
     }
 
     fn write(&mut self, offset: u32, _size: u8, value: u32) {
-        match offset {
-            0x00 => self.cr1 = value,
-            0x04 => self.cr2 = value,
-            0x08 => self.cr3 = value,
-            0x0C => self.brr = value,
-            0x20 => {} // ICR write-1-to-clear, no-op for stub
-            0x28 => self.sink.write_byte((value & 0xFF) as u8), // TDR
-            _ => {}
+        match (self.layout, offset) {
+            (UsartLayout::Modern, 0x00) => self.cr1 = value,
+            (UsartLayout::Modern, 0x04) => self.cr2 = value,
+            (UsartLayout::Modern, 0x08) => self.cr3 = value,
+            (UsartLayout::Modern, 0x0C) => self.brr = value,
+            (UsartLayout::Modern, 0x28) => self.sink.write_byte((value & 0xFF) as u8), // TDR
+            (UsartLayout::Legacy, 0x04) => self.sink.write_byte((value & 0xFF) as u8), // DR
+            (UsartLayout::Legacy, 0x08) => self.brr = value,
+            (UsartLayout::Legacy, 0x0C) => self.cr1 = value,
+            (UsartLayout::Legacy, 0x10) => self.cr2 = value,
+            (UsartLayout::Legacy, 0x14) => self.cr3 = value,
+            (UsartLayout::Legacy, 0x18) => self.gtpr = value,
+            _ => {} // ICR (modern) / SR clears (legacy): no-op for the stub
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_layout_transmits_on_dr() {
+        let sink = CapturingSink::new();
+        let mut u = Usart::new_legacy("usart2", Box::new(sink.clone()));
+        u.write(0x0C, 4, 0x200C); // CR1: UE | TE | RE
+        assert_eq!(u.read(0x0C, 4), 0x200C);
+        assert_eq!(u.read(0x00, 4) & TX_READY, TX_READY);
+        for b in b"ok" {
+            u.write(0x04, 4, *b as u32);
+        }
+        u.write(0x28, 4, b'x' as u32); // TDR offset means nothing here
+        assert_eq!(sink.snapshot(), b"ok");
+    }
+
+    #[test]
+    fn modern_layout_transmits_on_tdr() {
+        let sink = CapturingSink::new();
+        let mut u = Usart::new("usart3", Box::new(sink.clone()));
+        u.write(0x04, 4, b'x' as u32); // CR2, not data
+        u.write(0x28, 4, b'h' as u32);
+        assert_eq!(u.read(0x1C, 4), TX_READY);
+        assert_eq!(sink.snapshot(), b"h");
     }
 }

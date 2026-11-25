@@ -19,11 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
-//! Shared AES engine for the STM32 CRYP peripheral.
+//! Shared cipher engine for the STM32 CRYP peripheral.
 //!
-//! The register-shape adapter (v1 = H7 HAL v1, v2 = U5 HAL v2) is in
+//! The register-shape adapter (v1 = F4/H7 HAL v1, v2 = U5 HAL v2) is in
 //! per-revision modules. This module owns the actual cryptographic
-//! state (key, IV, FIFOs) and the per-block transform.
+//! state (key, IV, FIFOs) and the per-block transform: AES (16-byte
+//! blocks) on every revision, plus DES / TDES (8-byte blocks) on the v1
+//! CRYP found in F2/F4/F7/H7.
 
 pub mod gcm;
 pub mod v1;
@@ -32,6 +34,7 @@ pub mod v2;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
+use des::{Des, TdesEde3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySize {
@@ -54,6 +57,24 @@ pub enum AesMode {
     /// `aes::Aes*::decrypt_block`, so we just need to absorb (and
     /// silently discard) any DIN that arrives during this phase.
     KeyDerivation,
+    /// DES-ECB (v1 ALGOMODE 0b0010). Key K1.
+    DesEcb,
+    /// DES-CBC (v1 ALGOMODE 0b0011). Key K1, IV IV0.
+    DesCbc,
+    /// TDES-ECB (v1 ALGOMODE 0b0000). Keys K1/K2/K3, EDE.
+    TdesEcb,
+    /// TDES-CBC (v1 ALGOMODE 0b0001). Keys K1/K2/K3, IV IV0.
+    TdesCbc,
+}
+
+impl AesMode {
+    /// Cipher block length in bytes: 8 for DES/TDES, 16 for AES.
+    pub fn block_len(self) -> usize {
+        match self {
+            AesMode::DesEcb | AesMode::DesCbc | AesMode::TdesEcb | AesMode::TdesCbc => 8,
+            _ => 16,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +127,13 @@ impl DataType {
     }
 }
 
-/// Stateful CRYP engine: a 16-byte input FIFO that triggers a block
-/// transform once full, a 16-byte output FIFO drained by DOUT reads.
+/// Stateful CRYP engine: an input FIFO that triggers a block transform
+/// once it holds one cipher block (16 bytes AES, 8 bytes DES/TDES) and an
+/// output FIFO drained by DOUT reads.
 pub struct CrypEngine {
     pub key: [u8; 32],
+    /// DES / TDES key material K1 || K2 || K3 (DES uses K1 only).
+    pub des_key: [u8; 24],
     pub iv: [u8; 16],
     pub key_size: KeySize,
     pub mode: AesMode,
@@ -127,6 +151,7 @@ impl Default for CrypEngine {
     fn default() -> Self {
         Self {
             key: [0; 32],
+            des_key: [0; 24],
             iv: [0; 16],
             key_size: KeySize::K128,
             mode: AesMode::Ecb,
@@ -152,7 +177,7 @@ impl CrypEngine {
     }
 
     pub fn input_full(&self) -> bool {
-        self.in_len == 16
+        self.in_len >= self.mode.block_len()
     }
     pub fn input_empty(&self) -> bool {
         self.in_len == 0
@@ -161,13 +186,14 @@ impl CrypEngine {
         self.out_avail == 0
     }
     pub fn output_full(&self) -> bool {
-        self.out_avail == 16
+        self.out_avail == self.mode.block_len()
     }
 
     /// Push one DIN word. Triggers a block transform when the FIFO
-    /// hits 16 bytes.
+    /// holds one cipher block.
     pub fn write_din(&mut self, value: u32) {
-        if !self.enabled || self.in_len >= 16 {
+        let block_len = self.mode.block_len();
+        if !self.enabled || self.in_len >= block_len {
             return;
         }
         let swapped = self.datatype.swap(value);
@@ -176,7 +202,7 @@ impl CrypEngine {
             self.in_buf[self.in_len] = b;
             self.in_len += 1;
         }
-        if self.in_len == 16 {
+        if self.in_len == block_len {
             self.process_block();
         }
     }
@@ -238,11 +264,40 @@ impl CrypEngine {
                 // the input block on the floor.
                 emit = false;
             }
+            AesMode::DesEcb | AesMode::TdesEcb => {
+                let mut b8 = [0u8; 8];
+                b8.copy_from_slice(&block[..8]);
+                self.des_block(&mut b8);
+                block[..8].copy_from_slice(&b8);
+            }
+            AesMode::DesCbc | AesMode::TdesCbc => {
+                let mut b8 = [0u8; 8];
+                b8.copy_from_slice(&block[..8]);
+                match self.direction {
+                    Direction::Encrypt => {
+                        for i in 0..8 {
+                            b8[i] ^= self.iv[i];
+                        }
+                        self.des_block(&mut b8);
+                        self.iv[..8].copy_from_slice(&b8);
+                    }
+                    Direction::Decrypt => {
+                        let mut prev_iv = [0u8; 8];
+                        prev_iv.copy_from_slice(&self.iv[..8]);
+                        self.iv[..8].copy_from_slice(&b8);
+                        self.des_block(&mut b8);
+                        for i in 0..8 {
+                            b8[i] ^= prev_iv[i];
+                        }
+                    }
+                }
+                block[..8].copy_from_slice(&b8);
+            }
         }
         if emit {
             self.out_buf = block;
             self.out_pos = 0;
-            self.out_avail = 16;
+            self.out_avail = self.mode.block_len();
         }
         self.in_buf = [0; 16];
         self.in_len = 0;
@@ -259,6 +314,27 @@ impl CrypEngine {
         self.out_buf = *bytes;
         self.out_pos = 0;
         self.out_avail = 16;
+    }
+
+    /// DES or TDES (EDE with K1/K2/K3) on one 8-byte block, in the
+    /// selected direction.
+    fn des_block(&self, block: &mut [u8; 8]) {
+        let arr = GenericArray::from_mut_slice(block);
+        let tdes = matches!(self.mode, AesMode::TdesEcb | AesMode::TdesCbc);
+        match (tdes, self.direction) {
+            (false, Direction::Encrypt) => {
+                Des::new(GenericArray::from_slice(&self.des_key[..8])).encrypt_block(arr)
+            }
+            (false, Direction::Decrypt) => {
+                Des::new(GenericArray::from_slice(&self.des_key[..8])).decrypt_block(arr)
+            }
+            (true, Direction::Encrypt) => {
+                TdesEde3::new(GenericArray::from_slice(&self.des_key)).encrypt_block(arr)
+            }
+            (true, Direction::Decrypt) => {
+                TdesEde3::new(GenericArray::from_slice(&self.des_key)).decrypt_block(arr)
+            }
+        }
     }
 
     /// Apply the AES round selected by `direction` to `block` in place.

@@ -33,5 +33,5 @@ pub use dbgmcu::Dbgmcu;
 pub use hash::v1::HashV1;
 pub use pka::v2::PkaV2;
 pub use rcc::Rcc;
-pub use rng::Rng;
-pub use usart::{Usart, UsartSink};
+pub use rng::{Rng, RngFault, RngFaultKind};
+pub use usart::{Usart, UsartLayout, UsartSink};

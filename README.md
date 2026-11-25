@@ -50,6 +50,9 @@ supported targets:
 - **STM32MP135** (Cortex-A7 with MMU, runs out of DDR with no
   internal flash; CRYP1/HASH1/RNG1/PKA modelled, including SHA3 and
   SHAKE on HASH1)
+- **STM32F417 / F407** (Cortex-M4; F417 CRYP with DES/TDES and AES
+  ECB/CBC/CTR, HASH with SHA-1/MD5, RNG with seed/clock fault
+  injection)
 
 ## PIC32MZSim
 

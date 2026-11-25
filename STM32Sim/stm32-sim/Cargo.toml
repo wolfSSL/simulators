@@ -32,6 +32,7 @@ hex = "0.4"
 
 aes = "0.8"
 cipher = "0.4"
+des = "0.8"
 ctr = "0.9"
 cfb-mode = "0.8"
 ofb = "0.6"

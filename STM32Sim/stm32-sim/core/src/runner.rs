@@ -59,6 +59,9 @@ pub enum RunOutcome {
         elapsed: Duration,
     },
     Timeout {
+        /// Where the core was when the deadline passed: for a hung
+        /// firmware, the loop it is stuck in.
+        pc: u64,
         elapsed: Duration,
     },
     Fault {
@@ -107,6 +110,7 @@ impl Runner {
 
             if start.elapsed() > self.exit.timeout {
                 return Ok(RunOutcome::Timeout {
+                    pc: self.cpu.read_pc().unwrap_or(0),
                     elapsed: start.elapsed(),
                 });
             }

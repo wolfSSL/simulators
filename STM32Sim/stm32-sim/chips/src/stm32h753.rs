@@ -26,7 +26,7 @@ use stm32_sim_peripherals::{
     cryp::v1::CrypV1, hash::v1::HashV1, usart::StdoutSink, Dbgmcu, Rcc, Rng, Usart,
 };
 
-use crate::Chip;
+use crate::{Chip, ChipOptions};
 
 /// STM32H753 - Cortex-M7, 2 MiB flash, 1 MiB SRAM (split DTCM/AXI/SRAM).
 ///
@@ -43,7 +43,7 @@ use crate::Chip;
 pub struct Stm32H753;
 
 impl crate::ChipBuilder for Stm32H753 {
-    fn build() -> Result<Chip> {
+    fn build_with(opts: &ChipOptions) -> Result<Chip> {
         let memory = vec![
             MemoryRegion {
                 base: 0x0800_0000,
@@ -81,7 +81,7 @@ impl crate::ChipBuilder for Stm32H753 {
         let hash = wrap(HashV1::new());
         bus.map(0x4802_1400, 0x0400, "hash", hash);
 
-        let rng = wrap(Rng::new());
+        let rng = wrap(Rng::new().with_fault(opts.rng_fault));
         bus.map(0x4802_1800, 0x0400, "rng", rng);
 
         // DBGMCU @ 0x5C00_1000 - HAL reads IDCODE for revision-gated

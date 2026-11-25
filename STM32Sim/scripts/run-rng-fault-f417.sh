@@ -95,6 +95,13 @@ while read -r arm fault expect; do
         echo "FAIL  ${label} sanity seed returned '${sanity}' (sim exit ${rc})"
         echo "${out}" | tail -5
         FAILED=1
+    elif [[ ${rc} -ne 0 ]]; then
+        # The firmware prints RNG_FAULT before it sets test_complete, so
+        # a matching line alone is not a pass: the run must also end
+        # cleanly.
+        echo "FAIL  ${label} fault=${got} but the simulator exited ${rc}"
+        echo "${out}" | tail -5
+        FAILED=1
     elif [[ "|${expect}|" == *"|${got}|"* ]]; then
         echo "ok    ${label} fault=${got} mutex=ok"
     else

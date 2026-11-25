@@ -53,7 +53,8 @@ struct Args {
     #[arg(long)]
     list_chips: bool,
 
-    /// Inject an RNG fault after a number of RNG_DR reads:
+    /// Inject an RNG fault after a number of RNG_DR reads (0: present
+    /// from the start):
     /// `seed:<reads>` (seed error; clears once firmware clears SEIS and
     /// cycles RNGEN), `clock:<reads>` (clock error; clears by itself after
     /// a short glitch). Append `:sticky` for a fault that never clears.

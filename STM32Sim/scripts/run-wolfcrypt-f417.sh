@@ -70,7 +70,9 @@ stm32-sim \
 SIM_EXIT=${PIPESTATUS[0]}
 set -e
 
-if grep -q "=== wolfCrypt test passed! ===" "${LOG}"; then
+# The firmware prints its result line before it sets test_complete, so
+# the pass marker only counts if the simulator also exited cleanly.
+if [[ ${SIM_EXIT} -eq 0 ]] && grep -q "=== wolfCrypt test passed! ===" "${LOG}"; then
     echo
     echo "wolfCrypt tests completed successfully."
     exit 0
@@ -82,5 +84,8 @@ if grep -q "=== wolfCrypt test FAILED ===" "${LOG}"; then
 fi
 
 echo
-echo "wolfCrypt tests did not report a result string. Simulator exit=${SIM_EXIT}"
+echo "wolfCrypt tests did not finish cleanly. Simulator exit=${SIM_EXIT}"
+if [[ ${SIM_EXIT} -eq 0 ]]; then
+    exit 1
+fi
 exit "${SIM_EXIT}"

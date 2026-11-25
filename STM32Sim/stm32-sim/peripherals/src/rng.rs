@@ -58,7 +58,9 @@ pub enum RngFaultKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RngFault {
     pub kind: RngFaultKind,
-    /// DR reads served normally before the fault latches.
+    /// DR reads served normally before the fault latches. With 0 the
+    /// error is already present when the fault is armed, before the
+    /// firmware's first status check.
     pub after_reads: u64,
     /// A sticky fault never clears: a dead entropy source or a kernel
     /// clock that never returns. Otherwise a seed error clears once
@@ -161,9 +163,11 @@ impl Rng {
         Self::with_seed(0xDEAD_BEEF_CAFE_BABE)
     }
 
-    /// Arm a fault that latches after `fault.after_reads` DR reads.
+    /// Arm a fault that latches after `fault.after_reads` DR reads (at
+    /// once for 0).
     pub fn with_fault(mut self, fault: Option<RngFault>) -> Self {
         self.fault = fault;
+        self.maybe_latch_fault();
         self
     }
 
@@ -349,6 +353,26 @@ mod tests {
         assert_eq!(r.read(SR, 4), SR_DRDY);
         // The fault only fires once.
         drain(&mut r, 100);
+    }
+
+    /// A zero-read fault is there from the start: the first SR read already
+    /// shows it and no fresh data is served.
+    #[test]
+    fn zero_read_fault_is_present_before_first_read() {
+        let mut r = Rng::new().with_fault(fault("seed:0"));
+        assert_eq!(r.read(SR, 4), SR_SECS | SR_SEIS);
+        assert_eq!(r.read(DR, 4), 0);
+
+        let mut r = Rng::new().with_fault(fault("clock:0:sticky"));
+        r.write(CR, 4, CR_RNGEN);
+        assert_eq!(r.read(SR, 4), SR_CECS | SR_CEIS);
+
+        // One read later is a different fault from zero reads.
+        let mut r = Rng::new().with_fault(fault("seed:1:sticky"));
+        r.write(CR, 4, CR_RNGEN);
+        assert_eq!(r.read(SR, 4), SR_DRDY);
+        r.read(DR, 4);
+        assert_eq!(r.read(SR, 4), SR_SECS | SR_SEIS);
     }
 
     #[test]

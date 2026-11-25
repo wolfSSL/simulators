@@ -128,8 +128,9 @@ a hung firmware says where it hung.
 ### RNG fault injection
 
 `--rng-fault <seed|clock>:<reads>[:sticky]` makes the chip's RNG raise
-an error after `<reads>` RNG_DR reads, following the F2/F4 reference
-manual error management (RM0033 / RM0090):
+an error after `<reads>` RNG_DR reads (with `0`, the error is there
+before the first status check), following the F2/F4 reference manual
+error management (RM0033 / RM0090):
 
 - `seed`: SECS and SEIS latch and DRDY stays low until the firmware
   clears SEIS and cycles RNGEN.

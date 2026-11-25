@@ -26,7 +26,10 @@
  *
  * A correct wc_GenerateSeed() returns from step 2, either with 0 (the
  * RNG recovered) or RNG_FAILURE_E (it did not). The bug this guards
- * against is the call never returning.
+ * against is the call never returning. Every call must also leave the
+ * crypto hardware mutex released, whatever it returns: the Makefile links
+ * with ld --wrap for wolfSSL_CryptHwMutexLock/UnLock, so the firmware sees
+ * every lock and unlock and can track the lock depth.
  *
  * How the RNG is made to fail depends on the build:
  *
@@ -42,8 +45,9 @@
  *   Default (stm32-sim): the simulator's --rng-fault option latches the
  *   SECS or CECS condition after a set number of DR reads.
  *
- * test_result is 0 when step 1 passed and step 2 returned; the console
- * line "RNG_FAULT ... fault=<ret>" carries the step 2 return code. */
+ * test_result is 0 when step 1 passed, step 2 returned and the mutex was
+ * always released; the console line "RNG_FAULT ... fault=<ret>
+ * mutex=<ok|bad>" carries the step 2 return code and the mutex result. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -84,6 +88,9 @@ volatile uint32_t g_fault_fired_tick;
 volatile uint32_t g_rng_sr_after_fault;
 volatile uint32_t g_return_tick;
 volatile uint32_t g_hung;
+/* Crypto hardware mutex accounting (see the wrappers below). */
+volatile int32_t  g_hw_mutex_depth;
+volatile uint32_t g_hw_mutex_errors;
 
 static byte sanity_buf[SANITY_SZ];
 static byte fault_buf[FAULT_BUF_SZ];
@@ -133,6 +140,50 @@ static void uart_putd(int32_t v)
     } while (u != 0U);
     while (i > 0) {
         uart_putc(buf[--i]);
+    }
+}
+
+/* ---- crypto hardware mutex accounting ----------------------------------- */
+
+/* The Makefile links with --wrap=wolfSSL_CryptHwMutexLock and
+ * --wrap=wolfSSL_CryptHwMutexUnLock, so wolfSSL's calls land here and the
+ * real functions are reachable as __real_*. Locking while already held,
+ * unlocking while free, or still holding the mutex once a
+ * wc_GenerateSeed() call has returned all count as errors. */
+int __real_wolfSSL_CryptHwMutexLock(void);
+int __real_wolfSSL_CryptHwMutexUnLock(void);
+int __wrap_wolfSSL_CryptHwMutexLock(void);
+int __wrap_wolfSSL_CryptHwMutexUnLock(void);
+
+int __wrap_wolfSSL_CryptHwMutexLock(void)
+{
+    int ret = __real_wolfSSL_CryptHwMutexLock();
+
+    if (ret == 0) {
+        if (g_hw_mutex_depth != 0) {
+            g_hw_mutex_errors++;
+        }
+        g_hw_mutex_depth++;
+    }
+    return ret;
+}
+
+int __wrap_wolfSSL_CryptHwMutexUnLock(void)
+{
+    if (g_hw_mutex_depth <= 0) {
+        g_hw_mutex_errors++;
+    }
+    else {
+        g_hw_mutex_depth--;
+    }
+    return __real_wolfSSL_CryptHwMutexUnLock();
+}
+
+static void check_mutex_released(void)
+{
+    if (g_hw_mutex_depth != 0) {
+        g_hw_mutex_errors++;
+        g_hw_mutex_depth = 0;
     }
 }
 
@@ -257,6 +308,7 @@ int main(void)
 
     g_stage = STAGE_SANITY;
     g_sanity_ret = wc_GenerateSeed(&os, sanity_buf, sizeof(sanity_buf));
+    check_mutex_released();
     for (i = 0; i < (int)sizeof(sanity_buf); i++) {
         nonzero |= sanity_buf[i];
     }
@@ -278,6 +330,7 @@ int main(void)
     g_fault_tick = g_tick + FAULT_DELAY_MS;
 #endif
     g_fault_ret = wc_GenerateSeed(&os, fault_buf, sizeof(fault_buf));
+    check_mutex_released();
     g_stage = STAGE_DONE;
 #ifdef RNG_FAULT_BOARD
     g_return_tick = g_tick;
@@ -288,9 +341,9 @@ int main(void)
     uart_putd(g_sanity_ret);
     uart_puts(" fault=");
     uart_putd(g_fault_ret);
-    uart_puts("\n");
+    uart_puts(g_hw_mutex_errors == 0U ? " mutex=ok\n" : " mutex=bad\n");
 
-    if (g_sanity_ret == 0 &&
+    if (g_sanity_ret == 0 && g_hw_mutex_errors == 0U &&
             (g_fault_ret == 0 || g_fault_ret == RNG_FAILURE_E)) {
         test_result = 0;
         uart_puts("=== RNG fault test returned ===\n");

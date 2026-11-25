@@ -5,7 +5,9 @@ STM32F4 hardware-RNG fault test for wolfSSL's `wc_GenerateSeed()`.
 The firmware pulls a short seed with the RNG healthy, then a long one while
 the RNG fails part way through. A correct `wc_GenerateSeed()` returns from
 the second call, with `0` if the RNG recovered or `RNG_FAILURE_E` (-199) if
-it did not. The regression it guards against is the call never returning:
+it did not, and must leave the crypto hardware mutex released either way
+(the firmware wraps `wolfSSL_CryptHwMutexLock`/`UnLock` with `ld --wrap`
+and tracks the lock depth). The regression it guards against is the call never returning:
 before the fix, the Standard Peripheral Library arm of the `STM32_RNG` seed
 code polled DRDY with no bound, so a seed or clock error mid-request hung
 it forever with the crypto hardware mutex held.
@@ -61,6 +63,7 @@ What to look for:
 | `g_hung`        | set by SysTick if it has not returned 5 s after the fault |
 | `g_rng_sr_after_fault` | RNG_SR 100 ms after the fault |
 | `g_return_tick` | SysTick ms at which it returned (fault at `g_fault_fired_tick`) |
+| `g_hw_mutex_errors` | crypto hardware mutex misuse: locked while held, unlocked while free, or still held after a call (must be 0) |
 
 LEDs: green = sanity seed passed, orange = faulted call returned,
 red = faulted call hung, blue = heartbeat.

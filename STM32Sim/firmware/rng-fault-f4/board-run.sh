@@ -16,6 +16,7 @@ sym() {
 CMDS="program $ELF verify; reset run; sleep $((SECS * 1000)); halt;"
 for v in g_stage g_sanity_ret g_fault_ret g_tick g_fault_tick \
          g_fault_fired_tick g_rng_sr_after_fault g_return_tick g_hung \
+         g_hw_mutex_depth g_hw_mutex_errors \
          test_complete test_result; do
     a=$(sym "$v")
     CMDS="$CMDS echo \"$v [read_memory $a 32 1]\";"

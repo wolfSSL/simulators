@@ -63,7 +63,10 @@ ARCH     = -mcpu=cortex-m4 -mthumb -mfloat-abi=soft
 CPPFLAGS = -DWOLFSSL_USER_SETTINGS -D$(DEVICE) $(DEFS) \
            -I. -Istdperiph -I$(CMSIS_DEVICE) -I$(CMSIS_CORE) -I$(WOLFSSL_ROOT)
 CFLAGS   = $(ARCH) -Os -g -ffunction-sections -fdata-sections -Wall
+# --wrap lets main.c account for every crypto hardware mutex lock/unlock.
 LDFLAGS  = $(ARCH) -Tstm32f4.ld -nostartfiles -Wl,--gc-sections \
+           -Wl,--wrap=wolfSSL_CryptHwMutexLock \
+           -Wl,--wrap=wolfSSL_CryptHwMutexUnLock \
            -specs=nano.specs -specs=nosys.specs -Wl,-Map=$(BUILD)/rng-fault.map
 
 all: $(ELF)

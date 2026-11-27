@@ -35,8 +35,9 @@ Cargo workspace under [`stm32-sim/`](stm32-sim):
 stm32-sim/
   core/          CPU + MMIO bus + ELF loader + Runner
   peripherals/   USART, RCC, RNG, CRYP, HASH, PKA
-  chips/         STM32H753 / STM32U575 / STM32U585 / STM32MP135 chip
-                 configurations (memory map + peripheral wiring)
+  chips/         STM32F407 / STM32F417 / STM32H753 / STM32U575 /
+                 STM32U585 / STM32MP135 chip configurations (memory
+                 map + peripheral wiring)
   runner-bin/    `stm32-sim` CLI binary
 ```
 
@@ -52,19 +53,25 @@ even though three chips might present three different DIN/HR layouts.
 ## Status
 
 **STM32H753** (Cortex-M7, HAL v1, no PKA), **STM32U575/U585**
-(Cortex-M33, HAL v2, PKA v2), and **STM32MP135** (Cortex-A7,
-HAL v2 with the H7-style CRYP block, PKA v2) chip targets all boot,
-run firmware, and drive their on-chip cryptographic peripherals end-
-to-end:
+(Cortex-M33, HAL v2, PKA v2), **STM32MP135** (Cortex-A7, HAL v2 with
+the H7-style CRYP block, PKA v2) and **STM32F417** (Cortex-M4, the F4
+CRYP/HASH/RNG block) chip targets all boot, run firmware, and drive
+their on-chip cryptographic peripherals end-to-end. **STM32F407** is
+the F417 without CRYP and HASH (the STM32F4DISCOVERY part).
 
-| Peripheral | H7 (v1)                          | U5 (v2)            | MP135                                 |
-|------------|----------------------------------|--------------------|---------------------------------------|
-| USART      | OK                               | OK                 | OK (UART4)                            |
-| RCC        | stub                             | stub               | stub                                  |
-| RNG        | OK                               | OK                 | OK (RNG1)                             |
-| CRYP/AES   | ECB/CBC/CTR/GCM (HAL-driven)     | ECB/CBC/CTR/GCM    | ECB/CBC/CTR/GCM (CRYP1, aliased CRYP) |
-| HASH       | SHA-1/224/256, MD5               | SHA-1/224/256, MD5 | SHA-1/224/256, MD5, SHA-384/512, SHA3-224/256/384/512, SHAKE-128/256 (HASH1) |
-| PKA        | n/a                              | ECC mul (P-256/P-384), RSA modexp, mod arithmetic | same as U5 |
+| Peripheral | H7 (v1)                          | U5 (v2)            | MP135                                 | F417                          |
+|------------|----------------------------------|--------------------|---------------------------------------|-------------------------------|
+| USART      | OK                               | OK                 | OK (UART4)                            | OK (USART1/2/3, F4 layout)    |
+| RCC        | stub                             | stub               | stub                                  | stub                          |
+| RNG        | OK                               | OK                 | OK (RNG1)                             | OK                            |
+| CRYP/AES   | ECB/CBC/CTR/GCM (HAL-driven)     | ECB/CBC/CTR/GCM    | ECB/CBC/CTR/GCM (CRYP1, aliased CRYP) | DES/TDES ECB/CBC, AES ECB/CBC/CTR (no GCM/CCM on this part) |
+| HASH       | SHA-1/224/256, MD5               | SHA-1/224/256, MD5 | SHA-1/224/256, MD5, SHA-384/512, SHA3-224/256/384/512, SHAKE-128/256 (HASH1) | SHA-1, MD5 |
+| PKA        | n/a                              | ECC mul (P-256/P-384), RSA modexp, mod arithmetic | same as U5 | n/a |
+
+The F417 CRYP and HASH reject what the silicon lacks the same way the
+silicon does: the GCM/CCM mode bits and the HASH SHA-224/256 ALGO bit
+are reserved and dropped, so firmware that tries to use them gets the
+wrong answer rather than a silently working model.
 
 The MP135 is bare-metal Cortex-A7 with no internal flash. The firmware
 links at the DDR base (0xC0000000); the simulator maps DDR as plain
@@ -115,6 +122,30 @@ make -C firmware/smoke-test-mp135
 
 Expected output ends with `=== smoke test passed ===` and the binary
 exits 0 when the firmware sets `test_result = 0` and `test_complete = 1`.
+A run that hits `--timeout` exits 3 and logs the PC the core was at, so
+a hung firmware says where it hung.
+
+### RNG fault injection
+
+`--rng-fault <seed|clock>:<reads>[:sticky]` makes the chip's RNG raise
+an error after `<reads>` RNG_DR reads (with `0`, the error is there
+before the first status check), following the F2/F4 reference manual
+error management (RM0033 / RM0090):
+
+- `seed`: SECS and SEIS latch and DRDY stays low until the firmware
+  clears SEIS and cycles RNGEN.
+- `clock`: CECS and CEIS latch and DRDY stays low until the kernel clock
+  "recovers" a few dozen RNG_SR polls later; CEIS stays set until
+  cleared.
+- `:sticky`: the error never clears (a dead entropy source, a clock
+  that never comes back).
+
+[`firmware/rng-fault-f4/`](firmware/rng-fault-f4) uses this to check
+that wolfSSL's `wc_GenerateSeed()` returns rather than hangs when the
+F4 RNG fails mid-request, for both the Standard Peripheral Library and
+`WOLFSSL_STM32_RNG_NOLIB` arms (`scripts/run-rng-fault-f417.sh`). The
+same firmware also builds for a real STM32F4DISCOVERY, where it stops
+the RNG kernel clock itself; see that directory's README.
 
 ## Tests
 

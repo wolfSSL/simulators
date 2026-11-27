@@ -19,7 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
-//! STM32H7-style CRYP register file (HAL v1). See RM0433 §35.
+//! STM32F2/F4/F7/H7-style CRYP register file (HAL v1). See RM0090 section 23
+//! (F4) and RM0433 section 35 (H7).
 //!
 //! Register map (1 KiB peripheral, 4 KiB page on the bus):
 //!   0x00 CR        Control
@@ -30,8 +31,15 @@
 //!   0x14 IMSCR     Interrupt mask
 //!   0x18 RISR      Raw interrupt status
 //!   0x1C MISR      Masked interrupt status
-//!   0x20..0x3C     K0LR..K3RR (8 words = 256-bit key)
-//!   0x40..0x4C     IV0LR..IV1RR (4 words = 128-bit IV)
+//!   0x20..0x3C     K0LR..K3RR (8 words = 256-bit key; DES uses K1,
+//!                  TDES uses K1/K2/K3)
+//!   0x40..0x4C     IV0LR..IV1RR (4 words = 128-bit IV; DES/TDES use IV0)
+//!
+//! ALGOMODE: 0b0000 TDES-ECB, 0b0001 TDES-CBC, 0b0010 DES-ECB,
+//! 0b0011 DES-CBC, 0b0100 AES-ECB, 0b0101 AES-CBC, 0b0110 AES-CTR,
+//! 0b0111 AES key preparation, 0b1000 AES-GCM. The F405/F415/F417 CRYP
+//! predates GCM/CCM: ALGOMODE[3] (bit 19) and GCM_CCMPH (bits 17:16) are
+//! reserved there, see [`CrypV1::new_f4`].
 
 use stm32_sim_core::peripheral::Peripheral;
 
@@ -69,6 +77,8 @@ const CR_GCMPH_SHIFT: u32 = 16;
 const CR_GCMPH_MASK: u32 = 0x3 << CR_GCMPH_SHIFT;
 
 pub struct CrypV1 {
+    /// False on the F405/F415/F417 CRYP, which has no GCM/CCM.
+    gcm_capable: bool,
     cr: u32,
     key_regs: [u32; 8],
     iv_regs: [u32; 4],
@@ -89,8 +99,21 @@ impl Default for CrypV1 {
 }
 
 impl CrypV1 {
+    /// F7/H7-style CRYP: DES/TDES/AES including GCM.
     pub fn new() -> Self {
+        Self::with_gcm(true)
+    }
+
+    /// F405/F415/F417-style CRYP: DES/TDES and AES ECB/CBC/CTR only.
+    /// The GCM/CCM control bits are reserved, so writes to them are
+    /// dropped as silicon drops them.
+    pub fn new_f4() -> Self {
+        Self::with_gcm(false)
+    }
+
+    fn with_gcm(gcm_capable: bool) -> Self {
         Self {
+            gcm_capable,
             cr: 0,
             key_regs: [0; 8],
             iv_regs: [0; 4],
@@ -144,6 +167,11 @@ impl CrypV1 {
     fn write_cr(&mut self, value: u32) {
         let was_enabled = self.cr & CR_CRYPEN != 0;
         let prev_cr = self.cr;
+        let value = if self.gcm_capable {
+            value
+        } else {
+            value & !(CR_ALGOMODE_HI | CR_GCMPH_MASK)
+        };
         self.cr = value & !CR_FFLUSH; // FFLUSH self-clears
 
         if value & CR_FFLUSH != 0 {
@@ -209,6 +237,10 @@ impl CrypV1 {
         let algomode = algomode_low | if self.cr & CR_ALGOMODE_HI != 0 { 0x8 } else { 0 };
 
         self.engine.mode = match algomode {
+            0b0000 => AesMode::TdesEcb,
+            0b0001 => AesMode::TdesCbc,
+            0b0010 => AesMode::DesEcb,
+            0b0011 => AesMode::DesCbc,
             0b0100 => AesMode::Ecb,
             0b0101 => AesMode::Cbc,
             0b0110 => AesMode::Ctr,
@@ -216,7 +248,7 @@ impl CrypV1 {
             0b1000 => AesMode::Gcm,
             other => {
                 log::warn!(
-                    "CRYP v1: unsupported ALGOMODE 0x{:x} (modelled: AES ECB/CBC/CTR/GCM)",
+                    "CRYP v1: unsupported ALGOMODE 0x{:x} (modelled: DES/TDES ECB/CBC, AES ECB/CBC/CTR/GCM)",
                     other
                 );
                 AesMode::Ecb
@@ -224,6 +256,7 @@ impl CrypV1 {
         };
 
         self.engine.key = expand_key(&self.key_regs, self.engine.key_size);
+        self.engine.des_key = expand_des_key(&self.key_regs);
         self.engine.iv = expand_iv(&self.iv_regs);
         self.engine.reset_fifos();
         self.gcm_in_buf = [0; 16];
@@ -236,6 +269,21 @@ impl CrypV1 {
             } else {
                 self.gcm.phase = phase;
             }
+        }
+    }
+
+    /// The IV registers track the chaining value as blocks are processed
+    /// (CBC: the last ciphertext block, CTR: the counter); RM0090's
+    /// context-swap procedure saves them for exactly that reason, and
+    /// wolfSSL's HAL_V2 DES path reads IV0LR/IV0RR back as the next call's
+    /// IV.
+    fn sync_iv_regs(&mut self) {
+        if !self.engine.enabled {
+            return;
+        }
+        for (i, reg) in self.iv_regs.iter_mut().enumerate() {
+            let b = &self.engine.iv[i * 4..i * 4 + 4];
+            *reg = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
         }
     }
 
@@ -291,6 +339,16 @@ fn expand_key(regs: &[u32; 8], size: KeySize) -> [u8; 32] {
     out
 }
 
+/// DES / TDES key material: K1LR..K3RR (registers 2..8) in order. DES
+/// only uses the first 8 bytes (K1).
+fn expand_des_key(regs: &[u32; 8]) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    for (i, w) in regs[2..].iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+    }
+    out
+}
+
 fn expand_iv(regs: &[u32; 4]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (i, w) in regs.iter().enumerate() {
@@ -333,6 +391,7 @@ impl Peripheral for CrypV1 {
                     self.gcm_din(value);
                 } else {
                     self.engine.write_din(value);
+                    self.sync_iv_regs();
                 }
             }
             DMACR => self.dmacr = value,
@@ -347,6 +406,7 @@ impl Peripheral for CrypV1 {
                 // write so the next block sees the latest bytes.
                 if self.engine.enabled {
                     self.engine.key = expand_key(&self.key_regs, self.engine.key_size);
+                    self.engine.des_key = expand_des_key(&self.key_regs);
                 }
             }
             o if (IV_BASE..=IV_END).contains(&o) => {
@@ -589,5 +649,127 @@ mod tests {
         assert_eq!(read_word(&mut p, 0x0C), 0x516745bf);
         assert_eq!(read_word(&mut p, 0x0C), 0xeafc4990);
         assert_eq!(read_word(&mut p, 0x0C), 0x4b496089);
+    }
+
+    fn write_words(p: &mut CrypV1, off: u32, words: &[u32]) {
+        for w in words {
+            write_word(p, off, *w);
+        }
+    }
+
+    fn read_words(p: &mut CrypV1, n: usize) -> Vec<u32> {
+        (0..n).map(|_| read_word(p, 0x0C)).collect()
+    }
+
+    /// Classic single-DES worked example:
+    /// K = 133457799bbcdff1, PT = 0123456789abcdef, CT = 85e813540f0ab405.
+    #[test]
+    fn des_ecb_kat() {
+        let mut p = CrypV1::new_f4();
+        write_word(&mut p, 0x28, 0x13345779); // K1LR
+        write_word(&mut p, 0x2C, 0x9bbcdff1); // K1RR
+        write_word(&mut p, 0x00, (0b010 << 3) | CR_CRYPEN);
+        write_words(&mut p, 0x08, &[0x01234567, 0x89abcdef]);
+        assert_eq!(read_words(&mut p, 2), [0x85e81354, 0x0f0ab405]);
+
+        let mut p = CrypV1::new_f4();
+        write_word(&mut p, 0x28, 0x13345779);
+        write_word(&mut p, 0x2C, 0x9bbcdff1);
+        write_word(&mut p, 0x00, (0b010 << 3) | CR_ALGODIR | CR_CRYPEN);
+        write_words(&mut p, 0x08, &[0x85e81354, 0x0f0ab405]);
+        assert_eq!(read_words(&mut p, 2), [0x01234567, 0x89abcdef]);
+    }
+
+    /// wolfCrypt des_cbc_test vector, driven with DATATYPE=byte the way
+    /// wolfSSL's STM32 port feeds the CRYP.
+    #[test]
+    fn des_cbc_wolfcrypt_vector() {
+        let pt = b"now is the time for all ";
+        let ct: [u8; 24] = [
+            0x8b, 0x7c, 0x52, 0xb0, 0x01, 0x2b, 0x6c, 0xb8, 0x4f, 0x0f, 0xeb, 0xf3, 0xfb, 0x5f,
+            0x86, 0x73, 0x15, 0x85, 0xb3, 0x22, 0x4b, 0x86, 0x2b, 0x4b,
+        ];
+        let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+
+        for (dir, input, expect) in [(0, &pt[..], &ct[..]), (CR_ALGODIR, &ct[..], &pt[..])] {
+            let mut p = CrypV1::new_f4();
+            write_word(&mut p, 0x28, 0x01234567);
+            write_word(&mut p, 0x2C, 0x89abcdef);
+            write_word(&mut p, 0x40, 0x12345678);
+            write_word(&mut p, 0x44, 0x90abcdef);
+            write_word(&mut p, 0x00, (0b011 << 3) | (0b10 << CR_DATATYPE_SHIFT) | dir | CR_CRYPEN);
+            let mut out = Vec::new();
+            for blk in input.chunks(8) {
+                write_word(&mut p, 0x08, le(&blk[0..4]));
+                write_word(&mut p, 0x08, le(&blk[4..8]));
+                for w in read_words(&mut p, 2) {
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            assert_eq!(out.as_slice(), expect);
+        }
+    }
+
+    /// NIST SP 800-67 TDES example (K1 0123456789abcdef, K2
+    /// 23456789abcdef01, K3 456789abcdef0123, PT "The qufck brown fox
+    /// jump"), ECB, plus the same input in CBC with IV 1234567890abcdef
+    /// (expected values cross-checked with OpenSSL des-ede3 /
+    /// des-ede3-cbc).
+    #[test]
+    fn tdes_ecb_and_cbc_kats() {
+        let keys = [0x01234567, 0x89abcdef, 0x23456789, 0xabcdef01, 0x456789ab, 0xcdef0123];
+        let pt = [0x54686520, 0x71756663, 0x6b206272, 0x6f776e20, 0x666f7820, 0x6a756d70];
+        let ecb = [0xa826fd8c, 0xe53b855f, 0xcce21c81, 0x12256fe6, 0x68d5c05d, 0xd9b6b900];
+        let cbc = [0x38413d4b, 0xa2325cf1, 0x141f7074, 0x71ac2ced, 0x57db530f, 0x0123b5ac];
+
+        for (algo, expect) in [(0b000u32, ecb), (0b001u32, cbc)] {
+            for (dir, input, output) in [(0, pt, expect), (CR_ALGODIR, expect, pt)] {
+                let mut p = CrypV1::new_f4();
+                for (i, k) in keys.iter().enumerate() {
+                    write_word(&mut p, 0x28 + 4 * i as u32, *k);
+                }
+                write_word(&mut p, 0x40, 0x12345678);
+                write_word(&mut p, 0x44, 0x90abcdef);
+                write_word(&mut p, 0x00, (algo << 3) | dir | CR_CRYPEN);
+                let mut out = Vec::new();
+                for blk in input.chunks(2) {
+                    write_words(&mut p, 0x08, blk);
+                    out.extend(read_words(&mut p, 2));
+                }
+                assert_eq!(out.as_slice(), &output, "algo {algo:#b} dir {dir:#x}");
+            }
+        }
+    }
+
+    /// On the F417 CRYP, ALGOMODE[3] is reserved: asking for GCM
+    /// (ALGOMODE 0b1000) leaves ALGOMODE 0b000, i.e. TDES-ECB, and the
+    /// GCM_CCMPH bits read back as zero.
+    #[test]
+    fn f4_cryp_has_no_gcm() {
+        let mut p = CrypV1::new_f4();
+        write_word(&mut p, 0x00, CR_ALGOMODE_HI | (1 << 16) | CR_CRYPEN);
+        assert_eq!(read_word(&mut p, 0x00), CR_CRYPEN);
+        assert_eq!(p.engine.mode, AesMode::TdesEcb);
+
+        let mut p = CrypV1::new();
+        write_word(&mut p, 0x00, CR_ALGOMODE_HI | CR_CRYPEN);
+        assert_eq!(p.engine.mode, AesMode::Gcm);
+    }
+
+    /// After a CBC block the IV registers hold the last ciphertext block,
+    /// so firmware can read them back as the IV for the next call.
+    #[test]
+    fn cbc_iv_registers_track_chaining_value() {
+        let mut p = CrypV1::new_f4();
+        write_word(&mut p, 0x28, 0x01234567);
+        write_word(&mut p, 0x2C, 0x89abcdef);
+        write_word(&mut p, 0x40, 0x12345678);
+        write_word(&mut p, 0x44, 0x90abcdef);
+        write_word(&mut p, 0x00, (0b011 << 3) | CR_CRYPEN);
+        write_words(&mut p, 0x08, &[0x6e6f7720, 0x69732074]);
+        let ct = read_words(&mut p, 2);
+        assert_eq!(ct, [0x8b7c52b0, 0x012b6cb8]);
+        assert_eq!(read_word(&mut p, 0x40), ct[0]);
+        assert_eq!(read_word(&mut p, 0x44), ct[1]);
     }
 }

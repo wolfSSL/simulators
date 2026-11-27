@@ -1,0 +1,48 @@
+name: STM32Sim wolfCrypt test (F417)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  wolfcrypt-test:
+    name: wolfCrypt + RNG fault tests on STM32Sim F417
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout simulator-stm32
+        uses: actions/checkout@v4
+        with:
+          path: simulator-stm32
+
+      - name: Checkout wolfSSL
+        uses: actions/checkout@v4
+        with:
+          repository: wolfSSL/wolfssl
+          ref: master
+          path: wolfssl
+
+      - name: Build stm32sim-wolfcrypt image
+        run: |
+          docker build \
+            -t stm32sim-wolfcrypt:ci \
+            -f simulator-stm32/STM32Sim/Dockerfile.wolfcrypt \
+            simulator-stm32/STM32Sim
+
+      # CRYP (DES/TDES, AES ECB/CBC/CTR), HASH (SHA-1/MD5) and RNG through
+      # the STM32CubeF4 HAL.
+      - name: Run wolfCrypt test on stm32-sim (F417)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/wolfssl:/opt/wolfssl:ro" \
+            stm32sim-wolfcrypt:ci run-wolfcrypt-f417.sh
+
+      # wc_GenerateSeed() must return, not hang, when the RNG raises a
+      # seed or clock error mid-request (StdPeriph and NOLIB arms).
+      - name: Run RNG fault test on stm32-sim (F417)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/wolfssl:/opt/wolfssl:ro" \
+            stm32sim-wolfcrypt:ci run-rng-fault-f417.sh

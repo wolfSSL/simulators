@@ -29,6 +29,17 @@
 #define MICROCHIP_MPLAB_HARMONY
 #define MICROCHIP_PIC32
 #define WOLFSSL_HAVE_MCHP_HW_CRYPTO_HARMONY
+/* Seed from the PIC32MZ RNG block, as the direct port does (there it comes
+ * with WOLFSSL_MICROCHIP_PIC32MZ). Without it wolfSSL falls back to rand()
+ * seeded from the core timer, which it rejects as weak entropy. */
+#define WOLFSSL_PIC32MZ_RNG
+#endif
+
+/* The PIC32MZ EC has no TRNG: wolfSSL seeds its RNG block from the core
+ * timer, which it only accepts as a test configuration. This is a
+ * simulator, so accept it on EC; EF seeds from its TRNG. */
+#if defined(__PIC32_FEATURE_SET1) && (__PIC32_FEATURE_SET1 == 'C')
+#define WOLFSSL_ACCEPT_WEAK_ENTROPY
 #endif
 
 /* ---- No OS dependencies ---- */

@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use stm32_sim_chips::ChipOptions;
 use stm32_sim_core::{Cpu, ElfImage, ExitCondition, RunOutcome, Runner};
+use stm32_sim_peripherals::RngFault;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "wolfSSL STM32 simulator runner")]
@@ -50,6 +52,14 @@ struct Args {
     /// List supported chips and exit.
     #[arg(long)]
     list_chips: bool,
+
+    /// Inject an RNG fault after a number of RNG_DR reads (0: present
+    /// from the start):
+    /// `seed:<reads>` (seed error; clears once firmware clears SEIS and
+    /// cycles RNGEN), `clock:<reads>` (clock error; clears by itself after
+    /// a short glitch). Append `:sticky` for a fault that never clears.
+    #[arg(long, value_name = "KIND:READS[:sticky]")]
+    rng_fault: Option<RngFault>,
 
     /// ELF file to load.
     elf: Option<PathBuf>,
@@ -81,7 +91,10 @@ fn run(args: Args) -> Result<ExitCode> {
         .clone()
         .ok_or_else(|| anyhow!("ELF path required (or pass --list-chips)"))?;
 
-    let chip = stm32_sim_chips::build(&args.chip)?;
+    let opts = ChipOptions {
+        rng_fault: args.rng_fault,
+    };
+    let chip = stm32_sim_chips::build_with(&args.chip, &opts)?;
 
     let image = ElfImage::from_path_with_kind(&elf_path, chip.cpu_kind)
         .with_context(|| format!("loading {}", elf_path.display()))?;
@@ -122,8 +135,8 @@ fn run(args: Args) -> Result<ExitCode> {
             log::error!("FAIL (result={result}, elapsed={:?})", elapsed);
             Ok(ExitCode::FAILURE)
         }
-        RunOutcome::Timeout { elapsed } => {
-            log::error!("TIMEOUT after {:?}", elapsed);
+        RunOutcome::Timeout { pc, elapsed } => {
+            log::error!("TIMEOUT after {:?} at PC=0x{pc:08x}", elapsed);
             Ok(ExitCode::from(3))
         }
         RunOutcome::Fault { pc, elapsed } => {

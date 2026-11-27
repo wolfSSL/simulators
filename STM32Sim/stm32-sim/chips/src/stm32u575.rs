@@ -38,12 +38,12 @@ use stm32_sim_peripherals::{
     cryp::v2::CrypV2, hash::v1::HashV1, pka::v2::PkaV2, usart::StdoutSink, Dbgmcu, Rcc, Rng, Usart,
 };
 
-use crate::Chip;
+use crate::{Chip, ChipOptions};
 
 pub struct Stm32U575;
 
 impl crate::ChipBuilder for Stm32U575 {
-    fn build() -> Result<Chip> {
+    fn build_with(opts: &ChipOptions) -> Result<Chip> {
         let memory = vec![
             MemoryRegion {
                 base: 0x0800_0000,
@@ -91,7 +91,7 @@ impl crate::ChipBuilder for Stm32U575 {
         let hash = wrap(HashV1::new_u5());
         bus.map(0x420C_0400, 0x0400, "hash", hash);
 
-        let rng = wrap(Rng::new());
+        let rng = wrap(Rng::new().with_fault(opts.rng_fault));
         bus.map(0x420C_0800, 0x0400, "rng", rng);
 
         let pka = wrap(PkaV2::new());
@@ -119,8 +119,8 @@ impl crate::ChipBuilder for Stm32U575 {
 pub struct Stm32U585;
 
 impl crate::ChipBuilder for Stm32U585 {
-    fn build() -> Result<Chip> {
-        let mut chip = Stm32U575::build()?;
+    fn build_with(opts: &ChipOptions) -> Result<Chip> {
+        let mut chip = Stm32U575::build_with(opts)?;
         chip.name = "stm32u585";
         Ok(chip)
     }

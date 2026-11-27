@@ -19,12 +19,21 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
+pub mod stm32f417;
 pub mod stm32h753;
 pub mod stm32mp135;
 pub mod stm32u575;
 
 use anyhow::Result;
 use stm32_sim_core::{Bus, CpuKind, MemoryRegion};
+use stm32_sim_peripherals::RngFault;
+
+/// Run-time knobs that apply to every chip.
+#[derive(Debug, Clone, Default)]
+pub struct ChipOptions {
+    /// Fault to inject into the chip's RNG (`stm32-sim --rng-fault`).
+    pub rng_fault: Option<RngFault>,
+}
 
 pub struct Chip {
     pub name: &'static str,
@@ -34,19 +43,55 @@ pub struct Chip {
 }
 
 pub trait ChipBuilder {
-    fn build() -> Result<Chip>;
+    fn build_with(opts: &ChipOptions) -> Result<Chip>;
+
+    fn build() -> Result<Chip> {
+        Self::build_with(&ChipOptions::default())
+    }
 }
 
 pub fn build(name: &str) -> Result<Chip> {
+    build_with(name, &ChipOptions::default())
+}
+
+pub fn build_with(name: &str, opts: &ChipOptions) -> Result<Chip> {
     match name {
-        "stm32h753" => stm32h753::Stm32H753::build(),
-        "stm32u575" => stm32u575::Stm32U575::build(),
-        "stm32u585" => stm32u575::Stm32U585::build(),
-        "stm32mp135" => stm32mp135::Stm32Mp135::build(),
+        "stm32f407" => stm32f417::Stm32F407::build_with(opts),
+        "stm32f417" => stm32f417::Stm32F417::build_with(opts),
+        "stm32h753" => stm32h753::Stm32H753::build_with(opts),
+        "stm32u575" => stm32u575::Stm32U575::build_with(opts),
+        "stm32u585" => stm32u575::Stm32U585::build_with(opts),
+        "stm32mp135" => stm32mp135::Stm32Mp135::build_with(opts),
         other => anyhow::bail!("unknown chip: {other}"),
     }
 }
 
 pub fn list() -> &'static [&'static str] {
-    &["stm32h753", "stm32u575", "stm32u585", "stm32mp135"]
+    &["stm32f407", "stm32f417", "stm32h753", "stm32u575", "stm32u585", "stm32mp135"]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_listed_chip_builds() {
+        for name in list() {
+            let chip = build(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(chip.name, *name);
+        }
+        assert!(build("stm32f999").is_err());
+    }
+
+    #[test]
+    fn f417_has_crypto_and_f407_does_not() {
+        let has = |chip: &Chip, name: &str| chip.bus.regions.iter().any(|r| r.name == name);
+        let f417 = build("stm32f417").unwrap();
+        let f407 = build("stm32f407").unwrap();
+        for p in ["cryp", "hash", "rng", "rcc", "usart2"] {
+            assert!(has(&f417, p), "F417 missing {p}");
+        }
+        assert!(!has(&f407, "cryp") && !has(&f407, "hash"));
+        assert!(has(&f407, "rng"));
+    }
 }

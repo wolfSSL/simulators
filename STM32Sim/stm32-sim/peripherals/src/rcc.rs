@@ -77,6 +77,18 @@ impl Rcc {
         ));
         me
     }
+
+    /// STM32F2/F4 RCC ready bits. CR @ 0x00: HSIRDY(1), HSERDY(17),
+    /// PLLRDY(25), PLLI2SRDY(27). BDCR @ 0x70: LSERDY(1). CSR @ 0x74:
+    /// LSIRDY(1).
+    pub fn f4() -> Self {
+        let mut me = Self::raw("rcc-f4");
+        me.ready_offsets
+            .push((0x00, (1 << 1) | (1 << 17) | (1 << 25) | (1 << 27)));
+        me.ready_offsets.push((0x70, 1 << 1));
+        me.ready_offsets.push((0x74, 1 << 1));
+        me
+    }
 }
 
 impl Peripheral for Rcc {

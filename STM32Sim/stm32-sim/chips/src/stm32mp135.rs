@@ -57,12 +57,12 @@ use stm32_sim_peripherals::{
     cryp::v1::CrypV1, hash::v1::HashV1, pka::v2::PkaV2, usart::StdoutSink, Dbgmcu, Rcc, Rng, Usart,
 };
 
-use crate::Chip;
+use crate::{Chip, ChipOptions};
 
 pub struct Stm32Mp135;
 
 impl crate::ChipBuilder for Stm32Mp135 {
-    fn build() -> Result<Chip> {
+    fn build_with(opts: &ChipOptions) -> Result<Chip> {
         let memory = vec![
             MemoryRegion {
                 base: 0x2FFE_0000,
@@ -114,7 +114,7 @@ impl crate::ChipBuilder for Stm32Mp135 {
         let hash1 = wrap(HashV1::new_mp13());
         bus.map(0x5400_3000, 0x0400, "hash1", hash1);
 
-        let rng1 = wrap(Rng::new());
+        let rng1 = wrap(Rng::new().with_fault(opts.rng_fault));
         bus.map(0x5400_4000, 0x0400, "rng1", rng1);
 
         // PKA spans 0x2000 like on the U5, since the SRAM-style
